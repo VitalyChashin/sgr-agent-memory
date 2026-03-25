@@ -42,7 +42,21 @@ async def lifespan(_: FastAPI):
             raise ValueError(f"Unsupported MCP transport '{transport}'. Only 'sse' is currently supported.")
 
         mcp = create_mcp_server(config)
-        mcp_task = asyncio.create_task(mcp.run_sse_async(host=config.mcp_server.host, port=config.mcp_server.port))
+        host = config.mcp_server.host
+        port = config.mcp_server.port
+
+        # fastmcp v3.x: run_http_async(transport="sse"), v2.x: run_sse_async()
+        if hasattr(mcp, "run_http_async"):
+            from starlette.middleware import Middleware
+            from starlette.middleware.cors import CORSMiddleware
+
+            cors = Middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+            run_coro = mcp.run_http_async(transport="sse", host=host, port=port, middleware=[cors])
+        elif hasattr(mcp, "run_sse_async"):
+            run_coro = mcp.run_sse_async(host=host, port=port)
+        else:
+            run_coro = mcp.run_async(transport="sse", host=host, port=port)
+        mcp_task = asyncio.create_task(run_coro)
 
         def _mcp_task_done(task: asyncio.Task) -> None:
             if task.cancelled():

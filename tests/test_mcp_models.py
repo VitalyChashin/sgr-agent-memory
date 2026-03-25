@@ -74,6 +74,13 @@ class TestMCPServerConfig:
         assert config.port == 8011
         assert config.transport == "sse"
         assert config.default_agent is None
+        assert config.tool_name == "ask"
+        assert config.tool_description == "Send a research query to an SGR Agent and receive a structured response."
+
+    def test_custom_tool_name_and_description(self):
+        config = MCPServerConfig(tool_name="research", tool_description="Deep research tool")
+        assert config.tool_name == "research"
+        assert config.tool_description == "Deep research tool"
 
     def test_partial_override(self):
         config = MCPServerConfig(enabled=True, port=9000)

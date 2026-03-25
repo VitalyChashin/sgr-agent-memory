@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import TYPE_CHECKING, ClassVar, Self, TypeVar
+from typing import TYPE_CHECKING, Any, ClassVar, Self, TypeVar
 
 from fastmcp import Client
 from pydantic import BaseModel
@@ -62,16 +62,31 @@ class MCPBaseTool(BaseTool):
     """Base model for MCP Tool schema."""
 
     _client: ClassVar[Client | None] = None
+    _processor_chain: ClassVar[Any] = None  # MCPPayloadProcessorChain | None
+    _managed_fields: ClassVar[list[str]] = []
 
     async def __call__(self, context: AgentContext, config: AgentConfig, **kwargs) -> str:
-        config = GlobalConfig()
+        global_config = GlobalConfig()
         payload = self.model_dump(mode="json")
+
+        # Apply processor chain before MCP call
+        if self._processor_chain:
+            payload = await self._processor_chain.run_pre_call(payload, context, config, **kwargs)
+
         try:
             async with self._client:
                 result = await self._client.call_tool(self.tool_name, payload)
-                return json.dumps([m.model_dump_json() for m in result.content], ensure_ascii=False)[
-                    : config.execution.mcp_context_limit
+                result_str = json.dumps([m.model_dump_json() for m in result.content], ensure_ascii=False)[
+                    : global_config.execution.mcp_context_limit
                 ]
+
+                # Apply processor chain after MCP call
+                if self._processor_chain:
+                    result_str = await self._processor_chain.run_post_call(
+                        result_str, payload, context, config, **kwargs
+                    )
+
+                return result_str
         except Exception as e:
             logger.error(f"Error processing MCP tool {self.tool_name}: {e}")
             return f"Error: {e}"

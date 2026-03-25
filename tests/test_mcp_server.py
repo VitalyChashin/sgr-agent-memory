@@ -49,6 +49,44 @@ class TestMCPServerCreation:
         assert len(tool_names) == 1
 
 
+    @pytest.mark.asyncio
+    async def test_custom_tool_name(self):
+        from sgr_agent_core.mcp_server.config import MCPServerConfig
+        from sgr_agent_core.mcp_server.server import create_mcp_server
+
+        config = Mock()
+        config.mcp_server = MCPServerConfig(enabled=True, tool_name="research")
+        config.agents = {"a": Mock()}
+        mcp = create_mcp_server(config)
+        tools = await mcp.list_tools()
+        assert tools[0].name == "research"
+        assert len(tools) == 1
+
+    @pytest.mark.asyncio
+    async def test_custom_tool_description(self):
+        from sgr_agent_core.mcp_server.config import MCPServerConfig
+        from sgr_agent_core.mcp_server.server import create_mcp_server
+
+        config = Mock()
+        config.mcp_server = MCPServerConfig(enabled=True, tool_description="My custom desc")
+        config.agents = {"a": Mock()}
+        mcp = create_mcp_server(config)
+        tools = await mcp.list_tools()
+        assert tools[0].description == "My custom desc"
+
+    @pytest.mark.asyncio
+    async def test_empty_tool_name_falls_back_to_default(self):
+        from sgr_agent_core.mcp_server.config import MCPServerConfig
+        from sgr_agent_core.mcp_server.server import create_mcp_server
+
+        config = Mock()
+        config.mcp_server = MCPServerConfig(enabled=True, tool_name="")
+        config.agents = {"a": Mock()}
+        mcp = create_mcp_server(config)
+        tools = await mcp.list_tools()
+        assert tools[0].name == "ask"
+
+
 class TestAskTool:
     """Tests for the ask tool functionality."""
 

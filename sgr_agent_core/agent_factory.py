@@ -1,5 +1,7 @@
 """Agent Factory for dynamic agent creation from definitions."""
 
+from __future__ import annotations
+
 import logging
 from typing import Any, Type, TypeVar
 
@@ -86,12 +88,18 @@ class AgentFactory:
         return toolkit, tool_configs
 
     @classmethod
-    async def create(cls, agent_def: AgentDefinition, task_messages: list[ChatCompletionMessageParam]) -> Agent:
+    async def create(
+        cls,
+        agent_def: AgentDefinition,
+        task_messages: list[ChatCompletionMessageParam],
+        request_metadata: dict[str, Any] | None = None,
+    ) -> Agent:
         """Create an agent instance from a definition.
 
         Args:
             agent_def: Agent definition with configuration (classes already resolved)
             task_messages: Task messages in OpenAI ChatCompletionMessageParam format
+            request_metadata: Optional request-scoped metadata (traceId, userId, etc.) for MCP payload processors
 
         Returns:
             Created agent instance
@@ -147,6 +155,8 @@ class AgentFactory:
                 streaming_generator=cls._resolve_streaming_generator(agent_def.execution.streaming_generator),
                 **agent_kwargs,
             )
+            if request_metadata:
+                agent._context.request_metadata = request_metadata
             logger.info(
                 f"Created agent '{agent_def.name}' "
                 f"using base class '{BaseClass.__name__}' "

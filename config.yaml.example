@@ -39,6 +39,8 @@ execution:
 #   port: 8011              # Port to listen on (default: 8011)
 #   transport: "sse"        # Transport protocol (default: "sse")
 #   default_agent: null     # Agent to use (null = first available)
+#   tool_name: "ask"        # Custom MCP tool name (default: "ask")
+#   tool_description: "Send a research query to an SGR Agent and receive a structured response."  # Custom tool description
 
 # MCP (Model Context Protocol) Client Configuration
 mcp:
@@ -51,6 +53,16 @@ mcp:
     #   url: "https://your-mcp-server.com/mcp"
     #   headers:
     #     Authorization: "Bearer your-token"
+    #   # Payload processors: transform outgoing MCP call payloads
+    #   payload_processors:
+    #     - class: "TraceContextProcessor"
+    #       managed_fields: ["traceId"]  # Hidden from LLM schema
+    #       config:
+    #         default_trace_id: "trace-system-001"
+    #     - class: "AuthContextProcessor"
+    #       managed_fields: ["userId"]
+    #       config:
+    #         default_user_id: "user-system-001"
 
 
 # Note: The 'agents' field is optional and can be loaded from either:

@@ -37,6 +37,9 @@ from sgr_agent_core.services import (
 )
 from sgr_agent_core.tools import *  # noqa: F403
 
+# Import processors to trigger auto-registration in ProcessorRegistry
+import sgr_agent_core.processors  # noqa: F401
+
 __all__ = [
     # Version
     "__version__",

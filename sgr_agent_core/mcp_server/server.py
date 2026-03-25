@@ -28,7 +28,12 @@ def create_mcp_server(config: GlobalConfig) -> FastMCP:
     """
     mcp = FastMCP("sgr-agent-mcp")
 
-    @mcp.tool()
+    tool_name = config.mcp_server.tool_name or "ask"
+    tool_description = config.mcp_server.tool_description or (
+        "Send a research query to an SGR Agent and receive a structured response."
+    )
+
+    @mcp.tool(name=tool_name, description=tool_description)
     async def ask(
         query: str,
         traceId: str = "trace-default-001",
@@ -63,6 +68,7 @@ def create_mcp_server(config: GlobalConfig) -> FastMCP:
             agent = await AgentFactory.create(
                 agent_def=agent_def,
                 task_messages=[{"role": "user", "content": query}],
+                request_metadata={"traceId": traceId, "userId": userId},
             )
             result = await agent.execute()
         except Exception as e:

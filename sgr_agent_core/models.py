@@ -67,6 +67,10 @@ class AgentContext(BaseModel):
         default=None, description="Custom context for project-specific data"
     )
 
+    request_metadata: dict[str, Any] = Field(
+        default_factory=dict, description="Request-scoped metadata for MCP payload processors"
+    )
+
     def agent_state(self) -> dict:
         return self.model_dump(exclude={"searches", "sources", "clarification_received"})
 

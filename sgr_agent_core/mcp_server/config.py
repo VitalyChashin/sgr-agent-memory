@@ -11,3 +11,5 @@ class MCPServerConfig(BaseModel):
     port: int = 8011
     transport: str = "sse"
     default_agent: str | None = None
+    tool_name: str = "ask"
+    tool_description: str = "Send a research query to an SGR Agent and receive a structured response."
