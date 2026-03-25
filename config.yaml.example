@@ -32,7 +32,15 @@ execution:
 
   # Note: If both file and string are provided, string takes precedence
 
-# MCP (Model Context Protocol) Configuration
+# MCP Server Configuration (exposes SGR agents as an MCP server)
+# mcp_server:
+#   enabled: false           # Enable/disable the MCP server (default: false)
+#   host: "0.0.0.0"         # Host to bind (default: "0.0.0.0")
+#   port: 8011              # Port to listen on (default: 8011)
+#   transport: "sse"        # Transport protocol (default: "sse")
+#   default_agent: null     # Agent to use (null = first available)
+
+# MCP (Model Context Protocol) Client Configuration
 mcp:
   mcpServers:
     deepwiki:

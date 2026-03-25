@@ -7,6 +7,7 @@ import yaml
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from sgr_agent_core.agent_definition import AgentConfig, Definitions
+from sgr_agent_core.mcp_server.config import MCPServerConfig
 
 logger = logging.getLogger(__name__)
 
@@ -17,6 +18,9 @@ class GlobalConfig(BaseSettings, AgentConfig, Definitions):
 
     # Directory where main config.yaml lives (if loaded via from_yaml)
     config_dir: Path | None = None
+
+    # MCP server configuration (separate from mcp client config in AgentConfig)
+    mcp_server: MCPServerConfig = MCPServerConfig()
 
     def __new__(cls, *args, **kwargs):
         if cls._instance is None:

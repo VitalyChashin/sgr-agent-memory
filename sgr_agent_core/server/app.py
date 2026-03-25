@@ -1,5 +1,6 @@
 """FastAPI application instance creation and configuration."""
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 
@@ -28,7 +29,43 @@ async def lifespan(_: FastAPI):
     # Initialize OverlayFS for RunCommandTool if configured
     await OverlayFSManager.initialize_from_config()
 
+    # Start MCP server if enabled
+    mcp_task = None
+    from sgr_agent_core.agent_config import GlobalConfig
+
+    config = GlobalConfig()
+    if config.mcp_server.enabled:
+        from sgr_agent_core.mcp_server.server import create_mcp_server
+
+        transport = config.mcp_server.transport
+        if transport != "sse":
+            raise ValueError(f"Unsupported MCP transport '{transport}'. Only 'sse' is currently supported.")
+
+        mcp = create_mcp_server(config)
+        mcp_task = asyncio.create_task(mcp.run_sse_async(host=config.mcp_server.host, port=config.mcp_server.port))
+
+        def _mcp_task_done(task: asyncio.Task) -> None:
+            if task.cancelled():
+                return
+            exc = task.exception()
+            if exc is not None:
+                logger.error(f"MCP server crashed: {exc}", exc_info=exc)
+
+        mcp_task.add_done_callback(_mcp_task_done)
+        logger.info(f"MCP server started on {config.mcp_server.host}:{config.mcp_server.port} (transport={transport})")
+    else:
+        logger.info("MCP server disabled")
+
     yield
+
+    # Shutdown MCP server
+    if mcp_task is not None:
+        mcp_task.cancel()
+        try:
+            await mcp_task
+        except asyncio.CancelledError:
+            pass
+        logger.info("MCP server stopped")
 
     # Cleanup OverlayFS on shutdown
     await OverlayFSManager.cleanup()
