@@ -43,8 +43,9 @@ class SGRToolCallingAgent(BaseAgent):
 
     async def _reasoning_phase(self) -> ReasoningTool:
         phase_id = f"{self._context.iteration}-reasoning"
+        messages = await self._prepare_context()
         async with self.openai_client.chat.completions.stream(
-            messages=await self._prepare_context(),
+            messages=messages,
             tools=[pydantic_function_tool(self.ReasoningTool, name=self.ReasoningTool.tool_name)],
             tool_choice=self.tool_choice,
             **self.config.llm.to_openai_client_kwargs(),
@@ -54,6 +55,17 @@ class SGRToolCallingAgent(BaseAgent):
                     self.streaming_generator.add_chunk(event.chunk, phase_id)
             final_completion = await stream.get_final_completion()
         reasoning: ReasoningTool = final_completion.choices[0].message.tool_calls[0].function.parsed_arguments
+        # Populate LLM call info for observability generation spans
+        usage = final_completion.usage
+        response_msg = final_completion.choices[0].message
+        self._last_llm_call = {
+            "name": "reasoning",
+            "model": self.config.llm.model,
+            "model_parameters": {"temperature": self.config.llm.temperature, "max_tokens": self.config.llm.max_tokens},
+            "usage": {"input": usage.prompt_tokens, "output": usage.completion_tokens} if usage else None,
+            "input": messages,
+            "output": response_msg.content or self._truncate(reasoning.model_dump_json()),
+        }
         self.streaming_generator.add_tool_call(phase_id, reasoning)
         self.conversation.append(
             {
@@ -79,8 +91,9 @@ class SGRToolCallingAgent(BaseAgent):
 
     async def _select_action_phase(self, reasoning: ReasoningTool) -> BaseTool:
         phase_id = f"{self._context.iteration}-action"
+        messages = await self._prepare_context()
         async with self.openai_client.chat.completions.stream(
-            messages=await self._prepare_context(),
+            messages=messages,
             tools=await self._prepare_tools(),
             tool_choice=self.tool_choice,
             **self.config.llm.to_openai_client_kwargs(),
@@ -89,6 +102,17 @@ class SGRToolCallingAgent(BaseAgent):
                 if event.type == "chunk":
                     self.streaming_generator.add_chunk(event.chunk, phase_id)
             completion = await stream.get_final_completion()
+        # Populate LLM call info for observability generation spans
+        usage = completion.usage
+        response_msg = completion.choices[0].message
+        self._last_llm_call = {
+            "name": "action-selection",
+            "model": self.config.llm.model,
+            "model_parameters": {"temperature": self.config.llm.temperature, "max_tokens": self.config.llm.max_tokens},
+            "usage": {"input": usage.prompt_tokens, "output": usage.completion_tokens} if usage else None,
+            "input": messages,
+            "output": self._truncate(response_msg.content or str(response_msg.tool_calls)),
+        }
         try:
             tool = completion.choices[0].message.tool_calls[0].function.parsed_arguments
         except (IndexError, AttributeError, TypeError):

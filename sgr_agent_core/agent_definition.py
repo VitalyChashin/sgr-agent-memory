@@ -58,8 +58,15 @@ class LLMConfig(BaseModel, extra="allow"):
         default=None, description="Proxy URL (e.g., socks5://127.0.0.1:1081 or http://127.0.0.1:8080)"
     )
 
+    # When True, adds stream_options={"include_usage": True} for accurate token tracking.
+    # Disable for providers that don't support this parameter (e.g., Ollama, vLLM).
+    include_stream_usage: bool = Field(default=True, exclude=True, description="Include token usage in streams")
+
     def to_openai_client_kwargs(self) -> dict[str, Any]:
-        return self.model_dump(exclude={"api_key", "base_url", "proxy"})
+        kwargs = self.model_dump(exclude={"api_key", "base_url", "proxy", "include_stream_usage"})
+        if self.include_stream_usage:
+            kwargs.setdefault("stream_options", {"include_usage": True})
+        return kwargs
 
 
 class PromptsConfig(BaseModel, extra="allow"):

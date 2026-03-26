@@ -63,12 +63,39 @@ def create_mcp_server(config: GlobalConfig) -> FastMCP:
         else:
             raise ValueError("No agent definitions configured")
 
+        # Build request_metadata from configurable field mapping
+        field_mapping = config.observability.mcp_field_mapping
+        raw_payload = {"query": query, "traceId": traceId, "userId": userId}
+
+        request_metadata: dict = {}
+        # Map configured field names to standard metadata keys
+        if field_mapping.user_id and field_mapping.user_id in raw_payload:
+            request_metadata["userId"] = raw_payload[field_mapping.user_id]
+        if field_mapping.session_id and field_mapping.session_id in raw_payload:
+            request_metadata["sessionId"] = raw_payload[field_mapping.session_id]
+        if field_mapping.trace_id and field_mapping.trace_id in raw_payload:
+            request_metadata["traceId"] = raw_payload[field_mapping.trace_id]
+        # Include any extra configured fields
+        for extra_field in field_mapping.extra_fields:
+            if extra_field in raw_payload:
+                request_metadata[extra_field] = raw_payload[extra_field]
+        # Build tags from configured fields (format: "field:value")
+        tags = []
+        for tag_field in field_mapping.tags_fields:
+            if tag_field in raw_payload and raw_payload[tag_field]:
+                tags.append(f"{tag_field}:{raw_payload[tag_field]}")
+        if tags:
+            request_metadata["_tags"] = tags
+
+        # Store the full request payload for trace enrichment
+        request_metadata["_mcp_request_payload"] = raw_payload
+
         agent = None
         try:
             agent = await AgentFactory.create(
                 agent_def=agent_def,
                 task_messages=[{"role": "user", "content": query}],
-                request_metadata={"traceId": traceId, "userId": userId},
+                request_metadata=request_metadata,
             )
             result = await agent.execute()
         except Exception as e:
@@ -83,7 +110,7 @@ def create_mcp_server(config: GlobalConfig) -> FastMCP:
 
         response = AskResponse(
             response=str(result) if result is not None else "",
-            traceId=traceId,
+            traceId=request_metadata.get("traceId", traceId),
         )
         return json.dumps(response.model_dump())
 

@@ -90,6 +90,9 @@ docs = [
     "mkdocs-get-deps",
     "mkdocs-static-i18n",
 ]
+observability = [
+    "langfuse>=2.0.0,<3.0.0",
+]
 
 
 [tool.setuptools.packages.find]

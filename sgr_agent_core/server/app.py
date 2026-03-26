@@ -29,11 +29,15 @@ async def lifespan(_: FastAPI):
     # Initialize OverlayFS for RunCommandTool if configured
     await OverlayFSManager.initialize_from_config()
 
-    # Start MCP server if enabled
-    mcp_task = None
+    # Initialize observability provider
     from sgr_agent_core.agent_config import GlobalConfig
+    from sgr_agent_core.observability import init_provider
 
     config = GlobalConfig()
+    init_provider(config)
+
+    # Start MCP server if enabled
+    mcp_task = None
     if config.mcp_server.enabled:
         from sgr_agent_core.mcp_server.server import create_mcp_server
 
@@ -80,6 +84,11 @@ async def lifespan(_: FastAPI):
         except asyncio.CancelledError:
             pass
         logger.info("MCP server stopped")
+
+    # Shutdown observability provider
+    from sgr_agent_core.observability import get_provider
+
+    get_provider().shutdown()
 
     # Cleanup OverlayFS on shutdown
     await OverlayFSManager.cleanup()

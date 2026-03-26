@@ -32,17 +32,27 @@ class AgentFactory:
     def _create_client(cls, llm_config: LLMConfig) -> AsyncOpenAI:
         """Create OpenAI client from configuration.
 
+        Uses the active observability provider's factory method, which
+        returns a Langfuse-instrumented client when observability is
+        enabled, or a standard AsyncOpenAI client otherwise.
+
         Args:
             llm_config: LLM configuration
 
         Returns:
-            Configured AsyncOpenAI client
+            Configured AsyncOpenAI client (optionally instrumented)
         """
-        client_kwargs = {"base_url": llm_config.base_url, "api_key": llm_config.api_key}
-        if llm_config.proxy:
-            client_kwargs["http_client"] = httpx.AsyncClient(proxy=llm_config.proxy)
+        from sgr_agent_core.observability import get_provider
 
-        return AsyncOpenAI(**client_kwargs)
+        http_client = None
+        if llm_config.proxy:
+            http_client = httpx.AsyncClient(proxy=llm_config.proxy)
+
+        return get_provider().create_openai_client(
+            api_key=llm_config.api_key,
+            base_url=llm_config.base_url,
+            http_client=http_client,
+        )
 
     @classmethod
     def _resolve_streaming_generator(cls, name: str) -> type[OpenAIStreamingGenerator]:

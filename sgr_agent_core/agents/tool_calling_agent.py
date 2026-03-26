@@ -40,8 +40,9 @@ class ToolCallingAgent(BaseAgent):
 
     async def _select_action_phase(self, reasoning=None) -> BaseTool:
         phase_id = f"{self._context.iteration}-action"
+        messages = await self._prepare_context()
         async with self.openai_client.chat.completions.stream(
-            messages=await self._prepare_context(),
+            messages=messages,
             tools=await self._prepare_tools(),
             tool_choice=self.tool_choice,
             **self.config.llm.to_openai_client_kwargs(),
@@ -50,6 +51,17 @@ class ToolCallingAgent(BaseAgent):
                 if event.type == "chunk":
                     self.streaming_generator.add_chunk(event.chunk, phase_id)
             completion = await stream.get_final_completion()
+        # Populate LLM call info for observability generation spans
+        usage = completion.usage
+        response_msg = completion.choices[0].message
+        self._last_llm_call = {
+            "name": "action-selection",
+            "model": self.config.llm.model,
+            "model_parameters": {"temperature": self.config.llm.temperature, "max_tokens": self.config.llm.max_tokens},
+            "usage": {"input": usage.prompt_tokens, "output": usage.completion_tokens} if usage else None,
+            "input": messages,
+            "output": self._truncate(response_msg.content or str(response_msg.tool_calls)),
+        }
         tool = completion.choices[0].message.tool_calls[0].function.parsed_arguments
 
         if not isinstance(tool, BaseTool):

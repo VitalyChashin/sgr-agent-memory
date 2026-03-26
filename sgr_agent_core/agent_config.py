@@ -8,6 +8,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from sgr_agent_core.agent_definition import AgentConfig, Definitions
 from sgr_agent_core.mcp_server.config import MCPServerConfig
+from sgr_agent_core.observability.config import ObservabilityConfig
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +22,9 @@ class GlobalConfig(BaseSettings, AgentConfig, Definitions):
 
     # MCP server configuration (separate from mcp client config in AgentConfig)
     mcp_server: MCPServerConfig = MCPServerConfig()
+
+    # Observability configuration (disabled by default)
+    observability: ObservabilityConfig = ObservabilityConfig()
 
     def __new__(cls, *args, **kwargs):
         if cls._instance is None:

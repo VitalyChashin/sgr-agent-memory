@@ -19,6 +19,31 @@ execution:
   logs_dir: "logs"  # Directory for saving agent execution logs
   reports_dir: "reports"  # Directory for saving research reports
 
+# Observability Configuration (optional — disabled by default)
+# Install with: pip install sgr-agent-core[observability]
+# observability:
+#   enabled: true                         # Enable tracing (default: false)
+#   provider: "langfuse"                  # Provider: "langfuse" or "noop"
+#   langfuse:
+#     public_key: "pk-lf-..."             # Or set LANGFUSE_PUBLIC_KEY env var
+#     secret_key: "sk-lf-..."             # Or set LANGFUSE_SECRET_KEY env var
+#     base_url: "http://localhost:3000"   # Or set LANGFUSE_BASE_URL env var
+#     environment: "development"          # Environment tag for trace segmentation
+#     flush_at: 512                       # Events per batch before auto-flush
+#     flush_interval: 5.0                 # Seconds between flushes
+#     sample_rate: 1.0                    # Trace sampling rate (0.0-1.0)
+#     debug: false                        # Enable SDK debug logging
+#   metrics_processors:                   # Custom metrics attached to traces
+#     - class: "TokenEfficiencyProcessor" # Tracks total tokens and efficiency ratio
+#       config: {}
+#     - class: "ToolUsageProcessor"       # Tracks unique tools and total tool calls
+#       config: {}
+#   mcp_field_mapping:                    # Map MCP request fields to Langfuse filters
+#     user_id: "userId"                   # MCP field → Langfuse user_id filter
+#     session_id: "sessionId"             # MCP field → Langfuse session_id filter
+#     trace_id: "traceId"                 # MCP field → Langfuse trace correlation
+#     extra_fields: []                    # Additional MCP fields to include in metadata
+
 # MCP (Model Context Protocol) Configuration
 mcp:
   mcpServers:

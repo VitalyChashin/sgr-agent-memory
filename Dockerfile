@@ -17,8 +17,8 @@ COPY pyproject.toml MANIFEST.in README.md LICENSE ./
 COPY sgr_agent_core/ ./sgr_agent_core/
 COPY examples/ ./examples/
 
-# Install package from root
-RUN pip install --no-cache-dir .
+# Install package from root (with observability support)
+RUN pip install --no-cache-dir ".[observability]"
 
 # Remove build dependencies
 RUN apt purge -y build-essential \
