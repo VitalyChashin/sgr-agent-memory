@@ -1,0 +1,26 @@
+# SGR Agent Core - Joke Agent
+# Answers user questions with jokes. No MCP tools connected.
+# Deployed on mcp-network, backend port 8020, MCP server port 8021
+
+llm:
+  api_key: "sk-proj-gM0CAkd1FhTTdO7CUMM8T3BlbkFJ6FxVEpiXYU3wepgi30ZX"
+  base_url: "https://api.openai.com/v1"
+  model: "gpt-4o-mini"
+  max_tokens: 4000
+  temperature: 0.9
+
+execution:
+  max_clarifications: 1
+  max_iterations: 5
+  mcp_context_limit: 15000
+  logs_dir: "logs"
+  reports_dir: "reports"
+
+mcp_server:
+  enabled: true
+  host: "0.0.0.0"
+  port: 8021
+  transport: "sse"
+  default_agent: null
+  tool_name: "joke_agent"
+  tool_description: "Use this tool to get a funny joke or humorous answer on any topic"
