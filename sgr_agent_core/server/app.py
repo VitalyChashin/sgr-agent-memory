@@ -36,6 +36,11 @@ async def lifespan(_: FastAPI):
     config = GlobalConfig()
     init_provider(config)
 
+    # Initialize memory middleware if enabled
+    from sgr_agent_core.server.endpoints import init_memory_middleware
+
+    init_memory_middleware(config)
+
     # Start MCP server if enabled
     mcp_task = None
     if config.mcp_server.enabled:
@@ -84,6 +89,11 @@ async def lifespan(_: FastAPI):
         except asyncio.CancelledError:
             pass
         logger.info("MCP server stopped")
+
+    # Shutdown memory client
+    from sgr_agent_core.server.endpoints import shutdown_memory
+
+    await shutdown_memory()
 
     # Shutdown observability provider
     from sgr_agent_core.observability import get_provider

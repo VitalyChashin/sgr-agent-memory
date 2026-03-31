@@ -106,6 +106,14 @@ class ChatCompletionRequest(MessagesRequest):
     stream: bool = Field(default=True, description="Enable streaming mode")
     max_tokens: int | None = Field(default=1500, description="Maximum number of tokens")
     temperature: float | None = Field(default=0, description="Generation temperature")
+    session_id: str | None = Field(
+        default=None, alias="sessionId", max_length=256, pattern=r"^[^\x00-\x1f]*$", description="Session ID for memory"
+    )
+    user_id: str | None = Field(
+        default=None, alias="userId", max_length=256, pattern=r"^[^\x00-\x1f]*$", description="User ID for memory"
+    )
+
+    model_config = {"populate_by_name": True}
 
 
 class ChatCompletionChoice(BaseModel):

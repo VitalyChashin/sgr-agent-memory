@@ -26,6 +26,8 @@ def create_mcp_server(config: GlobalConfig) -> FastMCP:
     Returns:
         Configured FastMCP server instance.
     """
+    from sgr_agent_core.server.endpoints import get_memory_middleware
+
     mcp = FastMCP("sgr-agent-mcp")
 
     tool_name = config.mcp_server.tool_name or "ask"
@@ -38,6 +40,7 @@ def create_mcp_server(config: GlobalConfig) -> FastMCP:
         query: str,
         traceId: str = "trace-default-001",
         userId: str = "user-default-001",
+        sessionId: str = "",
     ) -> str:
         """Send a research query to an SGR Agent and receive a structured response.
 
@@ -45,6 +48,7 @@ def create_mcp_server(config: GlobalConfig) -> FastMCP:
             query: The research question or task for the agent.
             traceId: Trace identifier for request correlation (default: trace-default-001).
             userId: User identifier for the request (default: user-default-001).
+            sessionId: Session identifier for memory-enabled conversations (default: empty = no memory).
 
         Returns:
             JSON string with response text and traceId.
@@ -63,9 +67,10 @@ def create_mcp_server(config: GlobalConfig) -> FastMCP:
         else:
             raise ValueError("No agent definitions configured")
 
+        # Include sessionId in raw payload for field mapping
         # Build request_metadata from configurable field mapping
         field_mapping = config.observability.mcp_field_mapping
-        raw_payload = {"query": query, "traceId": traceId, "userId": userId}
+        raw_payload = {"query": query, "traceId": traceId, "userId": userId, "sessionId": sessionId}
 
         request_metadata: dict = {}
         # Map configured field names to standard metadata keys
@@ -90,16 +95,28 @@ def create_mcp_server(config: GlobalConfig) -> FastMCP:
         # Store the full request payload for trace enrichment
         request_metadata["_mcp_request_payload"] = raw_payload
 
+        # Memory preprocessing — only when sessionId is non-empty and middleware is active
+        memory_result = None
+        mw = get_memory_middleware()
+        if sessionId and mw is not None:
+            memory_result = await mw.preprocess(
+                messages=[{"role": "user", "content": query}],
+                session_id=sessionId,
+                user_id=userId,
+            )
+
+        task_messages = memory_result.messages if memory_result else [{"role": "user", "content": query}]
+
         agent = None
         try:
             agent = await AgentFactory.create(
                 agent_def=agent_def,
-                task_messages=[{"role": "user", "content": query}],
+                task_messages=task_messages,
                 request_metadata=request_metadata,
             )
             result = await agent.execute()
         except Exception as e:
-            logger.error(f"Agent execution failed: {e}", exc_info=True)
+            logger.error("Agent execution failed: %s", e, exc_info=True)
             raise ValueError("Agent execution failed") from e
         finally:
             if agent is not None and hasattr(agent, "cleanup"):
@@ -108,10 +125,31 @@ def create_mcp_server(config: GlobalConfig) -> FastMCP:
                 except Exception:
                     logger.warning("Agent cleanup failed", exc_info=True)
 
-        response = AskResponse(
-            response=str(result) if result is not None else "",
-            traceId=request_metadata.get("traceId", traceId),
-        )
-        return json.dumps(response.model_dump())
+        # Memory postprocessing — store assistant response synchronously
+        assistant_content = str(result) if result is not None else ""
+        if memory_result and memory_result.used_memory and mw is not None:
+            try:
+                await mw.postprocess(
+                    session_id=sessionId,
+                    user_message_id=memory_result.user_message_id or "",
+                    assistant_content=assistant_content,
+                    user_id=userId,
+                )
+            except Exception:
+                logger.warning("Memory postprocess failed for session=%s", sessionId, exc_info=True)
+
+        # Build response with optional topic metadata
+        response_kwargs: dict = {
+            "response": assistant_content,
+            "traceId": request_metadata.get("traceId", traceId),
+        }
+        if memory_result and memory_result.topic_metadata:
+            tm = memory_result.topic_metadata
+            response_kwargs["topicId"] = tm.topic_id
+            response_kwargs["topicLabel"] = tm.topic_label
+            response_kwargs["topicShift"] = tm.topic_shift
+
+        response = AskResponse(**response_kwargs)
+        return json.dumps(response.model_dump(exclude_none=True))
 
     return mcp

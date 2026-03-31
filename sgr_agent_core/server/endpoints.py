@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from typing import TYPE_CHECKING
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
@@ -17,12 +18,56 @@ from sgr_agent_core.server.models import (
 )
 from sgr_agent_core.utils import is_agent_id
 
+if TYPE_CHECKING:
+    from sgr_agent_core.agent_config import GlobalConfig
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
 # ToDo: better to move to a separate service
 agents_storage: dict[str, BaseAgent] = {}
+
+# ---------------------------------------------------------------------------
+# Memory middleware (initialised during server lifespan)
+# ---------------------------------------------------------------------------
+_memory_middleware = None
+_memory_client = None
+_background_tasks: set[asyncio.Task] = set()
+
+
+def init_memory_middleware(config: "GlobalConfig") -> None:
+    """Create the memory middleware if memory is enabled in config."""
+    global _memory_middleware, _memory_client
+    if not config.memory.enabled:
+        logger.debug("Memory layer disabled — skipping initialisation")
+        return
+
+    from sgr_agent_core.memory.client import MemoryServiceClient
+    from sgr_agent_core.memory.middleware import MemoryMiddleware
+
+    _memory_client = MemoryServiceClient(config.memory)
+    _memory_middleware = MemoryMiddleware(config=config.memory, client=_memory_client)
+    logger.info("Memory layer enabled — service_url=%s timeout=%ss", config.memory.service_url, config.memory.timeout)
+
+
+def get_memory_middleware():
+    """Return the active MemoryMiddleware, or None if disabled."""
+    return _memory_middleware
+
+
+async def shutdown_memory() -> None:
+    """Await pending background tasks, then close the memory HTTP client."""
+    global _memory_middleware, _memory_client
+    # Wait for in-flight store operations before closing the client
+    if _background_tasks:
+        logger.info("Awaiting %d pending memory background tasks", len(_background_tasks))
+        await asyncio.gather(*_background_tasks, return_exceptions=True)
+    if _memory_client is not None:
+        await _memory_client.close()
+        _memory_client = None
+        _memory_middleware = None
+        logger.info("Memory client closed")
 
 
 @router.get("/health", response_model=HealthResponse)
@@ -198,22 +243,96 @@ async def create_chat_completion(request: ChatCompletionRequest):
                 detail=f"Invalid model '{request.model}'. "
                 f"Available models: {[ad.name for ad in AgentFactory.get_definitions_list()]}",
             )
-        agent = await AgentFactory.create(agent_def, request.messages.root)
-        logger.info(f"Created agent '{request.model}' with {len(request.messages)} messages")
+
+        # Memory preprocessing — only when sessionId is present and middleware is active
+        memory_result = None
+        mw = get_memory_middleware()
+        if request.session_id and mw is not None:
+            memory_result = await mw.preprocess(
+                messages=request.messages.root,
+                session_id=request.session_id,
+                user_id=request.user_id,
+            )
+
+        task_messages = memory_result.messages if memory_result else request.messages.root
+
+        agent = await AgentFactory.create(agent_def, task_messages)
+        logger.info(f"Created agent '{request.model}' with {len(task_messages)} messages")
 
         agents_storage[agent.id] = agent
-        asyncio.create_task(agent.execute())
+        exec_task = asyncio.create_task(agent.execute())
+
+        # Fire-and-forget: store assistant response after agent completes
+        if memory_result and memory_result.used_memory:
+            bg_task = asyncio.create_task(
+                _store_assistant_response(
+                    exec_task=exec_task,
+                    agent=agent,
+                    session_id=request.session_id,
+                    user_message_id=memory_result.user_message_id,
+                    user_id=request.user_id,
+                )
+            )
+            _background_tasks.add(bg_task)
+            bg_task.add_done_callback(_background_tasks.discard)
+
+        response_headers = {
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Agent-ID": str(agent.id),
+            "X-Agent-Model": request.model,
+        }
+        # Add topic metadata as response headers when available
+        if memory_result and memory_result.topic_metadata:
+            tm = memory_result.topic_metadata
+            response_headers["X-Memory-Topic-Id"] = _sanitize_header(tm.topic_id)
+            response_headers["X-Memory-Topic-Label"] = _sanitize_header(tm.topic_label)
+            response_headers["X-Memory-Topic-Shift"] = str(tm.topic_shift).lower()
+
         return StreamingResponse(
             agent.streaming_generator.stream(),
             media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                "X-Agent-ID": str(agent.id),
-                "X-Agent-Model": request.model,
-            },
+            headers=response_headers,
         )
 
     except ValueError as e:
         logger.error(f"Error completion: {e}", exc_info=True)
         raise HTTPException(status_code=400, detail=str(e))
+
+
+def _sanitize_header(value: str) -> str:
+    """Strip control characters that could cause HTTP header injection."""
+    import re
+
+    return re.sub(r"[\r\n\x00]", "", value)[:256]
+
+
+async def _store_assistant_response(
+    exec_task: asyncio.Task,
+    agent: BaseAgent,
+    session_id: str,
+    user_message_id: str | None,
+    user_id: str | None,
+) -> None:
+    """Await agent completion, then store the assistant response via memory middleware.
+
+    This runs as a fire-and-forget background task — errors are logged
+    but never propagated.
+    """
+    try:
+        await exec_task
+    except BaseException:
+        return  # Agent failed or cancelled — nothing to store
+
+    assistant_content = agent._context.execution_result or ""
+    if not assistant_content:
+        return
+
+    mw = get_memory_middleware()
+    if mw is not None and user_message_id:
+        await mw.postprocess(
+            session_id=session_id,
+            user_message_id=user_message_id,
+            assistant_content=assistant_content,
+            user_id=user_id,
+        )
