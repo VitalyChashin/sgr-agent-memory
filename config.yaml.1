@@ -1,0 +1,47 @@
+# SGR Agent Core - Tool Calling Agent with Context Forge MCP Server
+# Deployed on mcp-network
+
+llm:
+  api_key: "sk-proj-gM0CAkd1FhTTdO7CUMM8T3BlbkFJ6FxVEpiXYU3wepgi30ZX"
+  base_url: "https://api.openai.com/v1"
+  model: "gpt-4o-mini"
+  max_tokens: 8000
+  temperature: 0.4
+
+execution:
+  max_clarifications: 3
+  max_iterations: 10
+  mcp_context_limit: 15000
+  logs_dir: "logs"
+  reports_dir: "reports"
+  
+mcp_server:
+   enabled: true           # Enable/disable the MCP server (default: false)
+   host: "0.0.0.0"         # Host to bind (default: "0.0.0.0")
+   port: 8011              # Port to listen on (default: 8011)
+   transport: "sse"        # Transport protocol (default: "sse")
+   default_agent: null     # Agent to use (null = first available)
+   tool_name: "time_agent"
+   tool_description: "Use the tool to ask questions about time"
+   
+observability:
+   enabled: true                         # Enable tracing (default: false)
+   provider: "langfuse"                  # Provider: "langfuse" or "noop"
+   langfuse:
+     public_key: "pk-lf-d62b29fd-99a9-47e2-9d65-d239c2bf8ec9"             # Or set LANGFUSE_PUBLIC_KEY env var
+     secret_key: "sk-lf-9bb7fb0a-15bd-4acf-907b-f2f094d38445"             # Or set LANGFUSE_SECRET_KEY env var
+     base_url: "http://host.docker.internal:3000"   # Or set LANGFUSE_BASE_URL env var
+     environment: "development"          # Environment tag for trace segmentation
+     flush_at: 512                       # Events per batch before auto-flush
+     flush_interval: 5.0                 # Seconds between flushes
+     sample_rate: 1.0                    # Trace sampling rate (0.0-1.0)
+     debug: true                        # Enable SDK debug logging
+
+# MCP Client: Connect to Context Forge virtual server via SSE
+# Uses host.docker.internal to reach the host-exposed port from inside Docker
+mcp:
+  mcpServers:
+    context_forge:
+      url: "http://host.docker.internal:4444/servers/93de07ef89df491fa3f1744a99f366ee/sse"
+      headers:
+        Authorization: "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJhZG1pbkBleGFtcGxlLmNvbSIsImlzcyI6Im1jcGdhdGV3YXkiLCJhdWQiOiJtY3BnYXRld2F5LWFwaSIsImlhdCI6MTc3NDQ1NjQ0NCwianRpIjoiNTYxYjQyN2ItMGQ0ZC00MWMzLWJhYjAtMGU5OTM4NjMxYWY5IiwidXNlciI6eyJlbWFpbCI6ImFkbWluQGV4YW1wbGUuY29tIiwiZnVsbF9uYW1lIjoiQVBJIFRva2VuIFVzZXIiLCJpc19hZG1pbiI6dHJ1ZSwiYXV0aF9wcm92aWRlciI6ImFwaV90b2tlbiJ9LCJ0ZWFtcyI6W10sIm5hbWVzcGFjZXMiOlsidXNlcjphZG1pbkBleGFtcGxlLmNvbSIsInB1YmxpYyJdLCJleHAiOjE3NzUwNjEyNDQsInNjb3BlcyI6eyJzZXJ2ZXJfaWQiOm51bGwsInBlcm1pc3Npb25zIjpbIioiXSwiaXBfcmVzdHJpY3Rpb25zIjpbXSwidGltZV9yZXN0cmljdGlvbnMiOnt9fX0.5RJDw-jnTBZd1i473nSvjleBkpdWgMgDizBzNkTdT4Q"
