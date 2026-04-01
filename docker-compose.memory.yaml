@@ -1,0 +1,49 @@
+services:
+  memory-service:
+    build:
+      context: .
+      dockerfile: memory_service/Dockerfile
+    container_name: sgr-memory-service
+    restart: unless-stopped
+    ports:
+      - "${MEMORY_PORT:-9100}:9100"
+    volumes:
+      - ./memory-config.yaml:/app/config.yaml:ro
+    environment:
+      - MEMORY_LLM_API_KEY=${MEMORY_LLM_API_KEY:-}
+    #depends_on:
+    #  memory-redis:
+    #    condition: service_healthy
+    #networks:
+    #  - memory-network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+
+#  memory-redis:
+#    image: redis:7-alpine
+#    container_name: sgr-memory-redis
+#    restart: unless-stopped
+#    ports:
+#      - "${MEMORY_REDIS_PORT:-6379}:6379"
+#    volumes:
+#      - memory-redis-data:/data
+#    healthcheck:
+#      test: ["CMD", "redis-cli", "ping"]
+#      interval: 10s
+#      timeout: 5s
+#      retries: 3
+#    networks:
+#      - memory-network
+#    logging:
+#      driver: "json-file"
+#      options:
+#        max-size: "10m"
+
+#volumes:
+#  memory-redis-data:
+
+#networks:
+#  memory-network:
+#    driver: bridge

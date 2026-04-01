@@ -42,6 +42,13 @@ execution:
 #   tool_name: "ask"        # Custom MCP tool name (default: "ask")
 #   tool_description: "Send a research query to an SGR Agent and receive a structured response."  # Custom tool description
 
+# Memory Configuration (topic-aware conversational memory)
+# memory:
+#   enabled: false                         # Enable/disable memory layer (default: false)
+#   service_url: "http://localhost:9100"   # Memory microservice URL
+#   timeout: 0.3                           # Request timeout in seconds (default: 0.3)
+#   max_messages: 50                       # Max messages returned per topic (default: 50)
+
 # MCP (Model Context Protocol) Client Configuration
 mcp:
   mcpServers:

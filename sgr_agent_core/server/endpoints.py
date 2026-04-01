@@ -253,6 +253,10 @@ async def create_chat_completion(request: ChatCompletionRequest):
                 session_id=request.session_id,
                 user_id=request.user_id,
             )
+        elif mw is not None and not request.session_id:
+            logger.debug("Memory enabled but sessionId not provided in request — skipping memory")
+        elif mw is None and request.session_id:
+            logger.warning("sessionId provided but memory middleware not initialized — check memory config")
 
         task_messages = memory_result.messages if memory_result else request.messages.root
 

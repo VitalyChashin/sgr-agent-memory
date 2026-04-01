@@ -104,6 +104,10 @@ def create_mcp_server(config: GlobalConfig) -> FastMCP:
                 session_id=sessionId,
                 user_id=userId,
             )
+        elif mw is not None and not sessionId:
+            logger.debug("Memory enabled but sessionId not provided in MCP ask call — skipping memory")
+        elif mw is None and sessionId:
+            logger.warning("sessionId provided but memory middleware not initialized — check memory config")
 
         task_messages = memory_result.messages if memory_result else [{"role": "user", "content": query}]
 
