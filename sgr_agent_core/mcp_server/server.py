@@ -104,8 +104,12 @@ def create_mcp_server(config: GlobalConfig) -> FastMCP:
         user_message: dict = {"role": "user", "content": query}
         session_history: list[dict] = []
         if sessionId:
-            store = get_session_store()
-            session_history = store.get_history(sessionId)
+            try:
+                store = get_session_store()
+                session_history = await store.get_history(sessionId)
+            except Exception:
+                logger.warning("Session store error, proceeding without history", exc_info=True)
+                session_history = []
 
         # Memory preprocessing — only when sessionId is non-empty and middleware is active
         memory_result = None
@@ -146,11 +150,16 @@ def create_mcp_server(config: GlobalConfig) -> FastMCP:
                 except Exception:
                     logger.warning("Agent cleanup failed", exc_info=True)
 
-        # Store this turn in session history (user msg + assistant response)
+        # Store this turn in session history (user msg + assistant response).
+        # The session store serves as the primary conversation history for MCP,
+        # and as a fallback when the topic-aware memory service is unavailable.
         assistant_content = str(result) if result is not None else ""
         if sessionId and assistant_content:
-            store = get_session_store()
-            store.append(sessionId, [user_message, {"role": "assistant", "content": assistant_content}])
+            try:
+                store = get_session_store()
+                await store.append(sessionId, [user_message, {"role": "assistant", "content": assistant_content}])
+            except Exception:
+                logger.warning("Session store append failed for session=%s", sessionId, exc_info=True)
 
         # Memory postprocessing — store assistant response synchronously
         if memory_result and memory_result.used_memory and mw is not None:
