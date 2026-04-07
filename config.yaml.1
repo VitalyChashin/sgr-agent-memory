@@ -2,7 +2,7 @@
 # Deployed on mcp-network
 
 llm:
-  api_key: "sk-proj-gM0CAkd1FhTTdO7CUMM8T3BlbkFJ6FxVEpiXYU3wepgi30ZX"
+  api_key: "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"
   base_url: "https://api.openai.com/v1"
   model: "gpt-4o-mini"
   max_tokens: 8000
@@ -24,7 +24,25 @@ mcp_server:
    tool_name: "time_agent"
    tool_description: "Use the tool to ask questions about time"
    
+# Memory Configuration (topic-aware conversational memory)
+memory:
+   enabled: true                         # Enable/disable memory layer (default: false)
+   #service_url: "http://host.docker.internal:9100"   # Memory microservice URL
+   #timeout: 30                           # Request timeout in seconds (default: 0.3)
+   #max_messages: 50                       # Max messages returned per topic (default: 50)
+   rolling_summary:
+     enabled: true                       # Enable/disable rolling summary (default: false)
+     max_tokens_to_summarize: 2000        # Token budget for the rolling window (100-32000)
+     summarization_model: null            # Model for summarization (null = agent's main model)
+     summarization_timeout_s: 10.0        # Hard timeout for summarizer call (0.01-120.0)
+     parallel_with_first_iteration: true  # Run in parallel with reasoning loop (default: true)
+   
 observability:
+   mcp_field_mapping:
+    user_id: "userId"
+    #trace_id: "traceId"
+    tags_fields:
+        - "traceId"
    enabled: true                         # Enable tracing (default: false)
    provider: "langfuse"                  # Provider: "langfuse" or "noop"
    langfuse:
@@ -36,6 +54,11 @@ observability:
      flush_interval: 5.0                 # Seconds between flushes
      sample_rate: 1.0                    # Trace sampling rate (0.0-1.0)
      debug: true                        # Enable SDK debug logging
+   metrics_processors:                   # Custom metrics attached to traces
+     - class: "TokenEfficiencyProcessor" # Tracks total tokens and efficiency ratio
+       config: {}
+     - class: "ToolUsageProcessor"       # Tracks unique tools and total tool calls
+       config: {}
 
 # MCP Client: Connect to Context Forge virtual server via SSE
 # Uses host.docker.internal to reach the host-exposed port from inside Docker
@@ -44,4 +67,4 @@ mcp:
     context_forge:
       url: "http://host.docker.internal:4444/servers/93de07ef89df491fa3f1744a99f366ee/sse"
       headers:
-        Authorization: "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJhZG1pbkBleGFtcGxlLmNvbSIsImlzcyI6Im1jcGdhdGV3YXkiLCJhdWQiOiJtY3BnYXRld2F5LWFwaSIsImlhdCI6MTc3NDQ1NjQ0NCwianRpIjoiNTYxYjQyN2ItMGQ0ZC00MWMzLWJhYjAtMGU5OTM4NjMxYWY5IiwidXNlciI6eyJlbWFpbCI6ImFkbWluQGV4YW1wbGUuY29tIiwiZnVsbF9uYW1lIjoiQVBJIFRva2VuIFVzZXIiLCJpc19hZG1pbiI6dHJ1ZSwiYXV0aF9wcm92aWRlciI6ImFwaV90b2tlbiJ9LCJ0ZWFtcyI6W10sIm5hbWVzcGFjZXMiOlsidXNlcjphZG1pbkBleGFtcGxlLmNvbSIsInB1YmxpYyJdLCJleHAiOjE3NzUwNjEyNDQsInNjb3BlcyI6eyJzZXJ2ZXJfaWQiOm51bGwsInBlcm1pc3Npb25zIjpbIioiXSwiaXBfcmVzdHJpY3Rpb25zIjpbXSwidGltZV9yZXN0cmljdGlvbnMiOnt9fX0.5RJDw-jnTBZd1i473nSvjleBkpdWgMgDizBzNkTdT4Q"
+        Authorization: "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJhZG1pbkBleGFtcGxlLmNvbSIsImlzcyI6Im1jcGdhdGV3YXkiLCJhdWQiOiJtY3BnYXRld2F5LWFwaSIsImlhdCI6MTc3NTU3ODgzOCwianRpIjoiOWViYjc5YjUtNGZkOC00NzJlLWI2ODgtYjllNzRiZGZmNmIyIiwidXNlciI6eyJlbWFpbCI6ImFkbWluQGV4YW1wbGUuY29tIiwiZnVsbF9uYW1lIjoiQVBJIFRva2VuIFVzZXIiLCJpc19hZG1pbiI6dHJ1ZSwiYXV0aF9wcm92aWRlciI6ImFwaV90b2tlbiJ9LCJ0ZWFtcyI6W10sIm5hbWVzcGFjZXMiOlsidXNlcjphZG1pbkBleGFtcGxlLmNvbSIsInB1YmxpYyJdLCJleHAiOjE3NzYxODM2MzgsInNjb3BlcyI6eyJzZXJ2ZXJfaWQiOm51bGwsInBlcm1pc3Npb25zIjpbIioiXSwiaXBfcmVzdHJpY3Rpb25zIjpbXSwidGltZV9yZXN0cmljdGlvbnMiOnt9fX0.eP7Z5AWKDQzhVbpT5vWTLsopj2ZmryPd2SPuvK0zDDA"

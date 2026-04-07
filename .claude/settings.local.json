@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(powershell -ExecutionPolicy Bypass -File .specify/scripts/powershell/create-new-feature.ps1 \"Topic-aware conversational memory architecture with middleware integration\" -Json -ShortName \"topic-aware-memory\")",
+      "Bash(pwsh -ExecutionPolicy Bypass -File .specify/scripts/powershell/create-new-feature.ps1 \"Topic-aware conversational memory architecture with middleware integration\" -Json -ShortName \"topic-aware-memory\")",
+      "Bash(pwsh -ExecutionPolicy Bypass -File .specify/scripts/powershell/check-prerequisites.ps1 -Json -PathsOnly)"
+    ]
+  }
+}
