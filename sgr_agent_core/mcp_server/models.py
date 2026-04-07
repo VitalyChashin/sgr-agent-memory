@@ -24,3 +24,5 @@ class AskResponse(BaseModel):
     topicId: str | None = None
     topicLabel: str | None = None
     topicShift: bool | None = None
+    conversationSummary: str | None = None
+    recentMessages: list[dict] | None = None

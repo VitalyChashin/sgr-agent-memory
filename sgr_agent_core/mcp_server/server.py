@@ -10,6 +10,7 @@ from fastmcp import FastMCP
 
 from sgr_agent_core.agent_factory import AgentFactory
 from sgr_agent_core.mcp_server.models import AskResponse
+from sgr_agent_core.mcp_server.session_store import get_session_store
 
 if TYPE_CHECKING:
     from sgr_agent_core.agent_config import GlobalConfig
@@ -95,21 +96,37 @@ def create_mcp_server(config: GlobalConfig) -> FastMCP:
         # Store the full request payload for trace enrichment
         request_metadata["_mcp_request_payload"] = raw_payload
 
+        # Build conversation history for the agent.
+        # MCP clients send a single query (unlike REST where the client replays
+        # full history), so the server accumulates turns in a session store when
+        # a sessionId is provided.  This gives rolling memory (and the agent in
+        # general) multi-turn context identical to the REST path.
+        user_message: dict = {"role": "user", "content": query}
+        session_history: list[dict] = []
+        if sessionId:
+            store = get_session_store()
+            session_history = store.get_history(sessionId)
+
         # Memory preprocessing — only when sessionId is non-empty and middleware is active
         memory_result = None
         mw = get_memory_middleware()
         if sessionId and mw is not None:
             memory_result = await mw.preprocess(
-                messages=[{"role": "user", "content": query}],
+                messages=[*session_history, user_message],
                 session_id=sessionId,
                 user_id=userId,
             )
         elif mw is not None and not sessionId:
             logger.debug("Memory enabled but sessionId not provided in MCP ask call — skipping memory")
         elif mw is None and sessionId:
-            logger.warning("sessionId provided but memory middleware not initialized — check memory config")
+            logger.debug("sessionId provided, using in-memory session store for conversation history")
 
-        task_messages = memory_result.messages if memory_result else [{"role": "user", "content": query}]
+        if memory_result:
+            task_messages = memory_result.messages
+        elif session_history:
+            task_messages = [*session_history, user_message]
+        else:
+            task_messages = [user_message]
 
         agent = None
         try:
@@ -129,8 +146,13 @@ def create_mcp_server(config: GlobalConfig) -> FastMCP:
                 except Exception:
                     logger.warning("Agent cleanup failed", exc_info=True)
 
-        # Memory postprocessing — store assistant response synchronously
+        # Store this turn in session history (user msg + assistant response)
         assistant_content = str(result) if result is not None else ""
+        if sessionId and assistant_content:
+            store = get_session_store()
+            store.append(sessionId, [user_message, {"role": "assistant", "content": assistant_content}])
+
+        # Memory postprocessing — store assistant response synchronously
         if memory_result and memory_result.used_memory and mw is not None:
             try:
                 await mw.postprocess(
@@ -142,7 +164,7 @@ def create_mcp_server(config: GlobalConfig) -> FastMCP:
             except Exception:
                 logger.warning("Memory postprocess failed for session=%s", sessionId, exc_info=True)
 
-        # Build response with optional topic metadata
+        # Build response with optional topic metadata and rolling memory fields
         response_kwargs: dict = {
             "response": assistant_content,
             "traceId": request_metadata.get("traceId", traceId),
@@ -152,6 +174,11 @@ def create_mcp_server(config: GlobalConfig) -> FastMCP:
             response_kwargs["topicId"] = tm.topic_id
             response_kwargs["topicLabel"] = tm.topic_label
             response_kwargs["topicShift"] = tm.topic_shift
+        if agent is not None:
+            if getattr(agent._context, "conversation_summary", None):
+                response_kwargs["conversationSummary"] = agent._context.conversation_summary
+            if getattr(agent._context, "recent_messages", None) is not None:
+                response_kwargs["recentMessages"] = agent._context.recent_messages
 
         response = AskResponse(**response_kwargs)
         return json.dumps(response.model_dump(exclude_none=True))
