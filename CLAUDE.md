@@ -60,6 +60,18 @@ sgr_agent_core/           # Core Python package
 
 MCP servers are configured in `config.yaml` under `mcp.mcpServers`. MCP tools use `MCPBaseTool` which handles calls through the MCP client and converts them to the framework's tool format. The framework uses `fastmcp` ≥ 2.12.4 for MCP server integration.
 
+## Processor Plugins
+
+Three processor-plugin families share one skeleton (auto-registering ABC + `*Definition` + `*Chain` + registry-then-import-string resolution; see `notes/processor-plugin-pattern.md`):
+
+| Family | When it runs | Can mutate? |
+|--------|--------------|-------------|
+| `MCPPayloadProcessor` (`mcp_payload_processor.py`) | per MCP tool call (`pre_call`/`post_call`) | yes |
+| `MetricsProcessor` (`observability/metrics/`) | at loop seams | no (observe only, fail-silent) |
+| `AgentContextProcessor` (`context_processors/`) | at loop seams | yes (read-write) |
+
+**Agent Context Processors** are configured **per-agent** via the `context_processors` list on `AgentConfig` (per-agent value replaces the global default). They run at three seams: `on_prepare_tools` (drop tools before selection), `on_tool_end`, and `on_before_finish` (veto a premature finish + inject messages). Hooks are fail-safe-but-visible (logged at WARNING; failures never loop the agent forever). Each hook is offered the active observability `provider`/`parent_span` for **optional** per-processor span emission (`emit_event_span`, a no-op under `NoOpProvider`). Built-ins: `RepeatedToolCallGuard`, `MandatoryToolCallProcessor`. Config example: `agents.yaml.example`.
+
 ## Development Commands
 
 ```bash

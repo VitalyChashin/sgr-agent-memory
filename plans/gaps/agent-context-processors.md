@@ -25,26 +25,29 @@ Close each by setting it resolved here (keep the node) once the plan/implementat
    to a non-finish resume state + injects the corrective message. (Sub-question for the plan:
    which exact `AgentStatesEnum` member is the correct "resume" state.)
 
-2. **Issue-1 counting scope.** Count *every* repeated identical call, or only repeated
-   **failed** ones (result string starts with `Error:`, per `base_tool.py:90-92`)? Counting
-   all is simpler and also catches stuck-on-success loops; failed-only is narrower.
+2. ~~**Issue-1 counting scope.**~~ **RESOLVED 2026-06-13.** Both, gated by config:
+   `RepeatedToolCallGuard` counts every call by default and exposes `failed_only: bool`
+   (`repeated_tool_call_guard.py`) to narrow to results starting with `"Error:"`.
 
-3. **Drop-tool vs instruct.** Removing the tool from `_prepare_tools` is deterministic but
-   shrinks capability and may confuse the model; injecting a "stop repeating tool X" message
-   is softer but unreliable. Which does the LLM handle better in practice? Possibly both,
-   gated by config.
+3. **Drop-tool vs instruct.** **Partially resolved 2026-06-13.** v1 ships the deterministic
+   *drop* (`on_prepare_tools` returns tool names to drop). The softer *instruct* path is
+   **deferred**: the prepare-tools seam returns only a `set[str]` and has no message-injection
+   channel (only `on_before_finish` injects). `RepeatedToolCallGuard` accepts an `announce`
+   flag but it currently only tags the emitted span — conversation injection of a "tool X
+   disabled" note still needs a seam that can mutate the conversation. Reopen if needed.
 
-4. **Provider / gateway side-effects of a shrinking tool list.** Does dropping a tool mid-run
-   interact badly with prompt/tool-list caching, or with the Context Forge MCP gateway's
-   expectations for the agent-as-tool surface? Needs a quick check before relying on it.
+4. **Provider / gateway side-effects of a shrinking tool list.** STILL OPEN. Dropping a tool
+   mid-run is implemented and unit/loop tested, but the interaction with prompt/tool-list
+   caching and the Context Forge MCP gateway's agent-as-tool surface is unverified — check
+   before relying on drop-mid-run in production.
 
-5. **Config merge semantics.** If we want a global baseline of context processors that
-   per-agent config extends/overrides (rather than pure per-agent lists), define the merge
-   rule. The existing `agent_level_config_override_validator` (`agent_definition.py:280`)
-   does field-level `model_copy(update=...)`, which replaces lists wholesale — extend
-   semantics would need explicit handling.
+5. ~~**Config merge semantics.**~~ **DEFERRED (decided) 2026-06-13.** v1 is per-agent
+   *replace*: `context_processors` is a plain `list` field on `AgentConfig`, so the override
+   validator (`agent_definition.py`) passes it through untouched (per-agent value replaces the
+   global default). Global-baseline + per-agent-extend merge is future work.
 
-6. **Fail policy granularity.** Confirm per-hook failure behaviour: a throwing
-   `on_prepare_tools` must not kill the agent (fall back to the unmodified toolkit), but a
-   throwing `on_before_finish` veto should probably let the agent finish rather than loop
-   forever. Decide and document.
+6. ~~**Fail policy granularity.**~~ **RESOLVED 2026-06-13.** Implemented in
+   `AgentContextProcessorChain` (`context_processors/base.py`): all three hooks are
+   fail-safe-but-visible (logged at WARNING). A throwing `on_prepare_tools` contributes no
+   drops (agent keeps full toolkit); a throwing `on_before_finish` is treated as no veto
+   (agent finishes — fail toward termination, never an infinite loop).

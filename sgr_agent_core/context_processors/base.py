@@ -1,0 +1,264 @@
+"""Agent Context Processor plugin system.
+
+The third processor-plugin family in SGR Agent Core (after the MCP payload
+processor and the metrics processor). It fills the "read-write at loop seams"
+quadrant: a context processor runs at agent-loop seams and may *change* what the
+agent does — drop a repeated tool before tool selection, or veto a premature
+finish and inject a corrective message.
+
+It reuses the established skeleton (see ``notes/processor-plugin-pattern.md``):
+an ABC that auto-registers concrete subclasses, a ``*Definition`` Pydantic
+model, a ``*Chain`` runner, and registry-then-import-string resolution.
+
+Observability is **optional and per-processor**. The base contract emits
+nothing; every hook is merely *offered* the active ``provider`` and a
+``parent_span`` via kwargs. A processor that wants monitoring calls
+``emit_event_span`` (a no-op under ``NoOpProvider``); one that doesn't ignores
+the kwargs.
+"""
+
+from __future__ import annotations
+
+import importlib
+import logging
+from abc import ABC
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any
+
+from pydantic import BaseModel, Field
+
+from sgr_agent_core.services.registry import Registry
+
+if TYPE_CHECKING:
+    from sgr_agent_core.agent_definition import AgentConfig
+    from sgr_agent_core.base_tool import BaseTool
+    from sgr_agent_core.models import AgentContext
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class FinishDecision:
+    """Directive returned by ``on_before_finish`` to veto a premature finish.
+
+    ``force_continue`` keeps the agent running; ``inject_messages`` are OpenAI
+    message dicts appended to the conversation before the next iteration.
+    """
+
+    force_continue: bool = False
+    inject_messages: list[dict[str, Any]] = field(default_factory=list)
+    reason: str | None = None
+
+
+class AgentContextProcessorRegistry(Registry["AgentContextProcessor"]):
+    """Registry for agent context processor classes."""
+
+
+class AgentContextProcessor(ABC):
+    """Abstract base for agent context processors.
+
+    Runs read-write at agent-loop seams. All hooks are optional and default to
+    a no-op; override only the seams you need. Subclasses auto-register in
+    ``AgentContextProcessorRegistry`` on definition.
+
+    Every hook also receives ``provider`` (the active ``ObservabilityProvider``)
+    and ``parent_span`` (a span handle or ``None``) in ``**kw`` for *optional*
+    span emission via :func:`emit_event_span`. The base class emits nothing.
+    """
+
+    def __init__(self, processor_config: dict[str, Any] | None = None):
+        self.processor_config = processor_config or {}
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        super().__init_subclass__(**kwargs)
+        if not getattr(cls, "__abstractmethods__", set()):
+            AgentContextProcessorRegistry.register(cls, name=cls.__name__)
+
+    async def on_tool_end(
+        self,
+        *,
+        tool: BaseTool,
+        result: str,
+        context: AgentContext,
+        config: AgentConfig,
+        **kw: Any,
+    ) -> None:
+        """Called after each tool executes. Receives the tool *instance*."""
+        return None
+
+    async def on_prepare_tools(
+        self,
+        *,
+        toolkit: list[type[BaseTool]],
+        context: AgentContext,
+        config: AgentConfig,
+        **kw: Any,
+    ) -> set[str]:
+        """Called before tool selection. Return tool names to drop."""
+        return set()
+
+    async def on_before_finish(
+        self,
+        *,
+        context: AgentContext,
+        config: AgentConfig,
+        **kw: Any,
+    ) -> FinishDecision | None:
+        """Called when the agent enters a finish state. Return a veto or None."""
+        return None
+
+
+class AgentContextProcessorChain:
+    """Ordered chain of context processors. Fail-safe-but-visible per hook."""
+
+    def __init__(self, processors: list[AgentContextProcessor]):
+        self.processors = processors
+
+    async def run_on_tool_end(
+        self,
+        tool: BaseTool,
+        result: str,
+        context: AgentContext,
+        config: AgentConfig,
+        *,
+        provider: Any = None,
+        parent_span: Any = None,
+    ) -> None:
+        for p in self.processors:
+            try:
+                await p.on_tool_end(
+                    tool=tool,
+                    result=result,
+                    context=context,
+                    config=config,
+                    provider=provider,
+                    parent_span=parent_span,
+                )
+            except Exception as e:
+                logger.warning("ctx-proc %s.on_tool_end failed: %s: %s", type(p).__name__, type(e).__name__, e)
+
+    async def run_prepare_tools(
+        self,
+        toolkit: list[type[BaseTool]],
+        context: AgentContext,
+        config: AgentConfig,
+        *,
+        provider: Any = None,
+        parent_span: Any = None,
+    ) -> set[str]:
+        drop: set[str] = set()
+        for p in self.processors:
+            try:
+                drop |= await p.on_prepare_tools(
+                    toolkit=toolkit,
+                    context=context,
+                    config=config,
+                    provider=provider,
+                    parent_span=parent_span,
+                )
+            except Exception as e:
+                # Fail-safe: this processor contributes no drops, agent keeps full toolkit.
+                logger.warning("ctx-proc %s.on_prepare_tools failed: %s: %s", type(p).__name__, type(e).__name__, e)
+        # NEVER drop system/terminal tools — the agent must always be able to finish.
+        system_names = {t.tool_name for t in toolkit if getattr(t, "isSystemTool", False)}
+        return drop - system_names
+
+    async def run_before_finish(
+        self,
+        context: AgentContext,
+        config: AgentConfig,
+        *,
+        provider: Any = None,
+        parent_span: Any = None,
+    ) -> FinishDecision:
+        merged = FinishDecision()
+        for p in self.processors:
+            try:
+                d = await p.on_before_finish(
+                    context=context,
+                    config=config,
+                    provider=provider,
+                    parent_span=parent_span,
+                )
+            except Exception as e:
+                # Fail-safe: a throwing veto lets the agent finish (never loop forever).
+                logger.warning("ctx-proc %s.on_before_finish failed: %s: %s", type(p).__name__, type(e).__name__, e)
+                continue
+            if d and d.force_continue:
+                merged.force_continue = True
+                merged.inject_messages.extend(d.inject_messages)
+        return merged
+
+
+class ContextProcessorDefinition(BaseModel, extra="allow"):
+    """Definition of a single context processor in YAML config."""
+
+    class_name: str = Field(alias="class", description="Processor class name or import string")
+    config: dict[str, Any] = Field(default_factory=dict)
+
+
+def build_context_processor_chain(config: AgentConfig) -> AgentContextProcessorChain | None:
+    """Build a per-agent context processor chain from config.
+
+    Returns ``None`` when no processors are configured (zero-cost path). Built
+    once per run so processor instances hold per-request state with no
+    cross-request leakage.
+    """
+    defs = getattr(config, "context_processors", None) or []
+    if not defs:
+        return None
+
+    processors: list[AgentContextProcessor] = []
+    for raw in defs:
+        try:
+            defn = (
+                raw if isinstance(raw, ContextProcessorDefinition) else ContextProcessorDefinition.model_validate(raw)
+            )
+        except Exception as e:
+            logger.warning("Failed to parse context processor definition %r: %s. Skipping.", raw, e)
+            continue
+        # Resolve class: registry first, then dotted import string.
+        cls = AgentContextProcessorRegistry.get(defn.class_name)
+        if cls is None:
+            try:
+                module_path, class_name = defn.class_name.rsplit(".", 1)
+                module = importlib.import_module(module_path)
+                cls = getattr(module, class_name)
+            except (ValueError, ImportError, AttributeError) as e:
+                logger.warning(
+                    "Context processor '%s' not found in registry and cannot be imported: %s. Skipping.",
+                    defn.class_name,
+                    e,
+                )
+                continue
+        try:
+            processors.append(cls(defn.config))
+        except Exception as e:
+            logger.warning("Failed to initialize context processor '%s': %s. Skipping.", defn.class_name, e)
+
+    if not processors:
+        return None
+
+    logger.info("Context processor chain initialized with %d processor(s)", len(processors))
+    return AgentContextProcessorChain(processors)
+
+
+def emit_event_span(provider: Any, parent_span: Any, name: str, metadata: dict[str, Any]) -> None:
+    """Emit a zero-duration event span. No-op under ``NoOpProvider``, so always safe to call.
+
+    Used by built-in processors to record *only when they actually fire* (a
+    tool is dropped / a finish is vetoed). Not referenced by the base class.
+    """
+    if provider is None:
+        return
+    try:
+        span = provider.start_span(
+            name=name,
+            span_type="event",
+            input=metadata,
+            metadata=metadata,
+            _parent=parent_span,
+        )
+        provider.end_span(span, output=metadata)
+    except Exception as e:
+        logger.warning("emit_event_span(%s) failed: %s: %s", name, type(e).__name__, e)

@@ -64,6 +64,12 @@ class BaseAgent(AgentRegistryMixin):
         self._execute_task: asyncio.Task | None = None
         self._last_llm_call: dict | None = None
 
+        # Agent Context Processor chain (built per run in _execute; None = zero-cost path).
+        # _current_iter_span lets _prepare_tools (deeper in the call stack, without iter_span
+        # in scope) parent any emitted span under the active iteration.
+        self._context_chain: Any = None
+        self._current_iter_span: Any = None
+
     @staticmethod
     def _truncate(value: Any, max_len: int = 2000) -> str:
         """Safely truncate any value to a string with max length."""
@@ -223,6 +229,17 @@ class BaseAgent(AgentRegistryMixin):
         tools = set(self.toolkit)
         if self._context.iteration >= self.config.execution.max_iterations:
             raise RuntimeError("Max iterations reached")
+        if self._context_chain:
+            from sgr_agent_core.observability import get_provider
+
+            drop = await self._context_chain.run_prepare_tools(
+                list(self.toolkit),
+                self._context,
+                self.config,
+                provider=get_provider(),
+                parent_span=self._current_iter_span,
+            )
+            tools = {t for t in tools if t.tool_name not in drop}
         return [pydantic_function_tool(tool, name=tool.tool_name) for tool in tools]
 
     async def _reasoning_phase(self) -> ReasoningTool:
@@ -344,6 +361,15 @@ class BaseAgent(AgentRegistryMixin):
                     provider=provider,
                     trace_handle=trace,
                 )
+            if self._context_chain:
+                await self._context_chain.run_on_tool_end(
+                    action_tool,
+                    tool_result,
+                    self._context,
+                    self.config,
+                    provider=provider,
+                    parent_span=tool_span,
+                )
         except Exception as tool_err:
             provider.end_span(
                 tool_span,
@@ -440,6 +466,12 @@ class BaseAgent(AgentRegistryMixin):
         from sgr_agent_core.observability.metrics import build_metrics_chain
 
         metrics_chain = build_metrics_chain(_GlobalConfig._instance or _GlobalConfig())
+
+        # Build per-agent context processor chain (None if none configured = zero overhead).
+        from sgr_agent_core.context_processors import build_context_processor_chain
+
+        self._context_chain = build_context_processor_chain(self.config)
+
         if metrics_chain:
             await metrics_chain.run_hook(
                 "on_trace_start",
@@ -512,9 +544,25 @@ class BaseAgent(AgentRegistryMixin):
                     metadata={"searches_used": self._context.searches_used},
                     _parent=trace,
                 )
+                # Expose the active iteration span so _prepare_tools (deeper in the
+                # call stack) can parent any context-processor span under it.
+                self._current_iter_span = iter_span
 
                 try:
                     await self._execution_step(iter_span=iter_span, metrics_chain=metrics_chain, trace=trace)
+
+                    # Agent Context Processor: before-finish seam. Runs right after a terminal
+                    # tool drove a finish state, before the loop re-checks. A veto resets the
+                    # state to a non-finish resume state and injects corrective messages.
+                    if self._context_chain and self._context.state in AgentStatesEnum.FINISH_STATES.value:
+                        decision = await self._context_chain.run_before_finish(
+                            self._context, self.config, provider=provider, parent_span=iter_span
+                        )
+                        if decision.force_continue:
+                            for m in decision.inject_messages:
+                                self.conversation.append(m)
+                            self._context.state = AgentStatesEnum.RESEARCHING
+
                     # Build iteration output with reasoning data if available
                     iter_output: dict[str, Any] = {"state_after": self._context.state.value}
                     reasoning = self._context.current_step_reasoning

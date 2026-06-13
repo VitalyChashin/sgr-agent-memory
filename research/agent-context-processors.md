@@ -1,8 +1,8 @@
 ---
 title: Generalizing context modification into an Agent Context Processor plugin system
-status: active
+status: archived
 created: 2026-06-13
-updated: 2026-06-13  # gap #1 resolved: tool_choice=required → terminate via FinalAnswerTool
+updated: 2026-06-13  # implemented in sgr_agent_core/context_processors/ (plan archived)
 owner: Vitaly Chashin
 related:
   - notes/processor-plugin-pattern.md

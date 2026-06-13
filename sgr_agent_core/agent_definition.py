@@ -10,6 +10,8 @@ import yaml
 from fastmcp.mcp_config import MCPConfig
 from pydantic import BaseModel, Field, FilePath, ImportString, computed_field, field_validator, model_validator
 
+from sgr_agent_core.context_processors.base import ContextProcessorDefinition
+
 logger = logging.getLogger(__name__)
 
 
@@ -162,6 +164,10 @@ class AgentConfig(BaseModel, extra="allow"):
     execution: ExecutionConfig = Field(default_factory=ExecutionConfig, description="Execution settings")
     prompts: PromptsConfig = Field(default_factory=PromptsConfig, description="Prompts settings")
     mcp: MCPConfig = Field(default_factory=MCPConfig, description="MCP settings")
+    context_processors: list[ContextProcessorDefinition] = Field(
+        default_factory=list,
+        description="Per-agent context processors run at agent-loop seams (replace, not merge, the global list)",
+    )
 
 
 class ToolDefinition(BaseModel, extra="allow"):

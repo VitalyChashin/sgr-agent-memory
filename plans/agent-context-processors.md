@@ -1,8 +1,8 @@
 ---
 title: Implementation plan — Agent Context Processor plugin system
-status: active
+status: archived
 created: 2026-06-13
-updated: 2026-06-13  # added optional per-processor Langfuse span emission
+updated: 2026-06-13  # implemented: context_processors/ package, BaseAgent seams, tests all green
 owner: Vitaly Chashin
 supersedes: []
 related:
