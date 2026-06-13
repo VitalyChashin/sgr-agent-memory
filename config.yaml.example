@@ -42,12 +42,30 @@ execution:
 #   tool_name: "ask"        # Custom MCP tool name (default: "ask")
 #   tool_description: "Send a research query to an SGR Agent and receive a structured response."  # Custom tool description
 
-# Memory Configuration (topic-aware conversational memory)
+# Memory Configuration
+# The two subsystems below are independent — each has its own "enabled" flag.
+# You can enable rolling_summary without enabling topic-aware memory (and vice versa).
+
 # memory:
-#   enabled: false                         # Enable/disable memory layer (default: false)
+#   # --- Topic-aware conversational memory (requires external microservice) ---
+#   enabled: false                         # Enable/disable topic-aware memory (default: false)
 #   service_url: "http://localhost:9100"   # Memory microservice URL
 #   timeout: 0.3                           # Request timeout in seconds (default: 0.3)
 #   max_messages: 50                       # Max messages returned per topic (default: 50)
+#
+#   # --- Rolling Memory (in-agent context compaction, no external service) ---
+#   # Splits conversation into recent window + summarized older history.
+#   # Rewrites agent context to [system] → [summary] → [recent turns].
+#   rolling_summary:
+#     enabled: false                       # Enable/disable rolling memory (default: false)
+#     max_tokens_to_summarize: 2000        # Token budget for the recent window (100-32000)
+#     summarization_model: null            # Model for summarization (null = agent's main model)
+#     summarization_timeout_s: 10.0        # Hard timeout for summarizer call (0.01-120.0)
+
+# Example: enable only rolling memory (no Redis/microservice needed):
+# memory:
+#   rolling_summary:
+#     enabled: true
 
 # MCP (Model Context Protocol) Client Configuration
 mcp:

@@ -3,6 +3,27 @@
 from pydantic import BaseModel, Field, field_validator
 
 
+class RollingSummaryConfig(BaseModel):
+    """Configuration for in-agent rolling memory buffer.
+
+    When ``enabled`` is True the agent splits incoming conversation into
+    a recent window (newest turns within the token budget) and older
+    history. The older history is summarized and injected into the
+    agent's context before reasoning. Disabled by default.
+    """
+
+    enabled: bool = Field(default=False, description="Whether rolling memory is active.")
+    max_tokens_to_summarize: int = Field(
+        default=2000, ge=100, le=32000, description="Token budget for the recent window."
+    )
+    summarization_model: str | None = Field(
+        default=None, description="Model for summarization. None = agent's main model."
+    )
+    summarization_timeout_s: float = Field(
+        default=10.0, gt=0.0, le=120.0, description="Hard timeout in seconds for the summarizer call."
+    )
+
+
 class MemoryConfig(BaseModel):
     """Configuration for topic-aware conversational memory.
 
@@ -36,4 +57,9 @@ class MemoryConfig(BaseModel):
         default=50,
         gt=0,
         description="Maximum messages returned per topic.",
+    )
+
+    rolling_summary: RollingSummaryConfig = Field(
+        default_factory=RollingSummaryConfig,
+        description="In-agent rolling memory buffer configuration.",
     )

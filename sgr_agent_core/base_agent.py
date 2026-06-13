@@ -279,8 +279,13 @@ class BaseAgent(AgentRegistryMixin):
             provider.end_generation(gen, output=llm_info.get("output"), usage=llm_info.get("usage"))
             if metrics_chain:
                 await metrics_chain.run_hook(
-                    "on_generation_end", gen_handle=gen, llm_info=llm_info,
-                    context=self._context, config=self.config, provider=provider, trace_handle=trace,
+                    "on_generation_end",
+                    gen_handle=gen,
+                    llm_info=llm_info,
+                    context=self._context,
+                    config=self.config,
+                    provider=provider,
+                    trace_handle=trace,
                 )
 
         action_tool = await self._select_action_phase(reasoning)
@@ -300,8 +305,13 @@ class BaseAgent(AgentRegistryMixin):
             provider.end_generation(gen, output=llm_info.get("output"), usage=llm_info.get("usage"))
             if metrics_chain:
                 await metrics_chain.run_hook(
-                    "on_generation_end", gen_handle=gen, llm_info=llm_info,
-                    context=self._context, config=self.config, provider=provider, trace_handle=trace,
+                    "on_generation_end",
+                    gen_handle=gen,
+                    llm_info=llm_info,
+                    context=self._context,
+                    config=self.config,
+                    provider=provider,
+                    trace_handle=trace,
                 )
 
         # Trace tool execution with full arguments
@@ -325,9 +335,14 @@ class BaseAgent(AgentRegistryMixin):
             )
             if metrics_chain:
                 await metrics_chain.run_hook(
-                    "on_tool_end", tool_span_handle=tool_span, tool_name=tool_name,
-                    tool_result=tool_result, context=self._context, config=self.config,
-                    provider=provider, trace_handle=trace,
+                    "on_tool_end",
+                    tool_span_handle=tool_span,
+                    tool_name=tool_name,
+                    tool_result=tool_result,
+                    context=self._context,
+                    config=self.config,
+                    provider=provider,
+                    trace_handle=trace,
                 )
         except Exception as tool_err:
             provider.end_span(
@@ -386,9 +401,7 @@ class BaseAgent(AgentRegistryMixin):
 
         # Build trace input — include full MCP request payload if available
         trace_input: dict[str, Any] = {
-            "task": self._truncate(
-                self.task_messages[-1].get("content", "") if self.task_messages else ""
-            ),
+            "task": self._truncate(self.task_messages[-1].get("content", "") if self.task_messages else ""),
             "agent_type": self.__class__.__name__,
             "messages_count": len(self.task_messages),
         }
@@ -429,14 +442,63 @@ class BaseAgent(AgentRegistryMixin):
         metrics_chain = build_metrics_chain(_GlobalConfig._instance or _GlobalConfig())
         if metrics_chain:
             await metrics_chain.run_hook(
-                "on_trace_start", trace_handle=trace, context=self._context,
-                config=self.config, provider=provider,
+                "on_trace_start",
+                trace_handle=trace,
+                context=self._context,
+                config=self.config,
+                provider=provider,
             )
 
         self.logger.info(f"🚀 User provided {len(self.task_messages)} messages.")
         init_message = f"Agent {self.id} started\n"
         self.conversation.append({"role": "system", "content": init_message})
         self.streaming_generator.add_content_delta(init_message, "0-start")
+
+        # Rolling memory — compact context before reasoning loop
+        _original_task_messages = self.task_messages
+        try:
+            from sgr_agent_core.memory.config import RollingSummaryConfig
+
+            memory_cfg = getattr(self.config, "memory", None)
+            if isinstance(memory_cfg, dict):
+                rs_raw = memory_cfg.get("rolling_summary")
+            else:
+                rs_raw = getattr(memory_cfg, "rolling_summary", None)
+            rs_cfg = RollingSummaryConfig.model_validate(rs_raw) if isinstance(rs_raw, dict) else rs_raw
+
+            if rs_cfg is not None and rs_cfg.enabled:
+                from sgr_agent_core.memory.rolling_summary import RollingSummaryBuffer
+
+                _buf = RollingSummaryBuffer(rs_cfg, self.openai_client, self.config.llm.model)
+                system_msgs, older_history, recent_window = _buf.split_conversation(self.task_messages)
+
+                # Store recent window on context (for response fields)
+                self._context.recent_messages = recent_window
+
+                if older_history:
+                    summary_text = await _buf.summarize(older_history)
+                    if summary_text:
+                        self.task_messages = _buf.compact_messages(system_msgs, summary_text, recent_window)
+                        self._context.conversation_summary = summary_text
+                        self.logger.info(
+                            "Rolling memory: compacted %d messages → summary + %d recent",
+                            len(_original_task_messages),
+                            len(recent_window),
+                        )
+                    else:
+                        # Summarization failed — fall back to full messages
+                        self.task_messages = _original_task_messages
+                        self._context.recent_messages = None
+                        self.logger.warning("Rolling memory: summarization failed, using full messages")
+                else:
+                    # All messages fit in budget — no summarization needed
+                    self._context.conversation_summary = None
+        except Exception as _rs_err:
+            self.logger.warning("Rolling memory init failed: %s", _rs_err)
+            self.task_messages = _original_task_messages
+            self._context.conversation_summary = None
+            self._context.recent_messages = None
+
         try:
             while self._context.state not in AgentStatesEnum.FINISH_STATES.value:
                 self._context.iteration += 1
@@ -459,9 +521,7 @@ class BaseAgent(AgentRegistryMixin):
                     if reasoning is not None:
                         try:
                             iter_output["reasoning"] = {
-                                "current_situation": self._truncate(
-                                    getattr(reasoning, "current_situation", None), 500
-                                ),
+                                "current_situation": self._truncate(getattr(reasoning, "current_situation", None), 500),
                                 "plan_status": self._truncate(getattr(reasoning, "plan_status", None), 500),
                                 "remaining_steps": getattr(reasoning, "remaining_steps", []),
                                 "enough_data": getattr(reasoning, "enough_data", None),
@@ -475,8 +535,12 @@ class BaseAgent(AgentRegistryMixin):
                     )
                     if metrics_chain:
                         await metrics_chain.run_hook(
-                            "on_iteration_end", iter_span_handle=iter_span, context=self._context,
-                            config=self.config, provider=provider, trace_handle=trace,
+                            "on_iteration_end",
+                            iter_span_handle=iter_span,
+                            context=self._context,
+                            config=self.config,
+                            provider=provider,
+                            trace_handle=trace,
                         )
                 except Exception as iter_err:
                     provider.end_span(
@@ -489,8 +553,11 @@ class BaseAgent(AgentRegistryMixin):
             # Run metrics on_trace_end before closing trace
             if metrics_chain:
                 await metrics_chain.run_hook(
-                    "on_trace_end", trace_handle=trace, context=self._context,
-                    config=self.config, provider=provider,
+                    "on_trace_end",
+                    trace_handle=trace,
+                    context=self._context,
+                    config=self.config,
+                    provider=provider,
                 )
 
             # End trace on success — capture full structured output
@@ -537,6 +604,19 @@ class BaseAgent(AgentRegistryMixin):
             self._flush_provider_async(provider)
             traceback.print_exc()
         finally:
+            # Restore original task_messages so agent log and post-execution code see full history
+            self.task_messages = _original_task_messages
+
+            # Emit rolling memory metadata before finishing stream
+            if self.streaming_generator is not None:
+                metadata: dict[str, Any] = {}
+                if self._context.conversation_summary is not None:
+                    metadata["conversationSummary"] = self._context.conversation_summary
+                if self._context.recent_messages is not None:
+                    metadata["recentMessages"] = self._context.recent_messages
+                if metadata:
+                    self.streaming_generator.add_metadata_event(metadata)
+
             if self.streaming_generator is not None:
                 self.streaming_generator.finish(
                     phase_id=f"{self._context.iteration}-final", content=self._context.execution_result
