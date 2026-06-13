@@ -12,12 +12,18 @@ related:
 Unresolved questions surfaced during research (`research/agent-context-processors.md`).
 Close each by setting it resolved here (keep the node) once the plan/implementation settles it.
 
-1. **Zero-call termination path of the production agent.** All production agents are
-   `ToolCallingAgent` with reasoning disabled. `SGRToolCallingAgent` synthesises a
-   `FinalAnswerTool` on empty `tool_calls` (`agents/sgr_tool_calling_agent.py:116-125`), but
-   `ToolCallingAgent` indexes `tool_calls[0]` (`agents/tool_calling_agent.py:65`) and looks
-   like it would raise `IndexError`. **Need to confirm how a zero-tool-call turn actually
-   ends in production** — it determines where the Issue-2 `on_before_finish` hook must fire.
+1. ~~**Zero-call termination path of the production agent.**~~ **RESOLVED 2026-06-13.**
+   `ToolCallingAgent` sets `tool_choice = "required"` (`agents/tool_calling_agent.py:35`), so
+   the LLM must emit a tool call every turn — the empty-`tool_calls` path cannot occur and
+   `tool_calls[0]` (`:65`) is safe. The graceful fallback exists only in `SGRToolCallingAgent`
+   (`:116-125`), unused in production. Termination is therefore **always** via a terminal
+   `SystemBaseTool` — `FinalAnswerTool` (`tools/final_answer_tool.py:33-36`) sets
+   `state = COMPLETED/FAILED`; loop exits at `base_agent.py:503`. "Router answered itself" =
+   `FinalAnswerTool` called with **zero** prior work-tool calls, where a work tool is one with
+   `isSystemTool == False` (`base_tool.py:35`, `:55`). The `on_before_finish` hook fires right
+   after a terminal tool drives a finish state, before the loop re-checks; veto resets `state`
+   to a non-finish resume state + injects the corrective message. (Sub-question for the plan:
+   which exact `AgentStatesEnum` member is the correct "resume" state.)
 
 2. **Issue-1 counting scope.** Count *every* repeated identical call, or only repeated
    **failed** ones (result string starts with `Error:`, per `base_tool.py:90-92`)? Counting

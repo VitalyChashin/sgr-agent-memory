@@ -2,7 +2,7 @@
 title: Generalizing context modification into an Agent Context Processor plugin system
 status: active
 created: 2026-06-13
-updated: 2026-06-13
+updated: 2026-06-13  # gap #1 resolved: tool_choice=required → terminate via FinalAnswerTool
 owner: Vitaly Chashin
 related:
   - notes/processor-plugin-pattern.md
@@ -169,17 +169,23 @@ decision (see §4).
   identical *successful* call is also stuck).
 - **Repeated-failure detection today: none.** The loop runs to `max_iterations`
   (`base_agent.py:224`, raises `RuntimeError`). No dedup, no per-call counters.
-- **Zero-tool-call / "answer without calling" (Issue 2).** Behaviour differs by agent class:
-  - `SGRToolCallingAgent` (`agents/sgr_tool_calling_agent.py:116-125`) catches the empty
-    `tool_calls` case and **synthesises a `FinalAnswerTool`** — i.e. it lets the agent finish
-    with zero calls. This is exactly the router-answers-itself path.
-  - `ToolCallingAgent` indexes `tool_calls[0]` (`agents/tool_calling_agent.py:65`) and would
-    raise `IndexError` on an empty list. **Confirm in plan phase** how the production
-    `ToolCallingAgent` actually terminates a zero-call turn — the fix's trigger point depends
-    on it.
-  - Tool-call count per turn is derivable from `self.conversation` (assistant entries bearing
-    `tool_calls`) or from the execution log (`step_type == "tool_execution"`,
-    `base_agent.py:167`).
+- **Zero-tool-call / "answer without calling" (Issue 2) — resolved (gap #1, 2026-06-13).**
+  - `ToolCallingAgent` sets `tool_choice = "required"` (`agents/tool_calling_agent.py:35`), so
+    the LLM **must** emit a tool call every turn. The empty-`tool_calls` / bare-content path
+    **cannot occur** for the production agent; `tool_calls[0]` (`:65`) is therefore safe. The
+    graceful-fallback branch only exists in `SGRToolCallingAgent`
+    (`agents/sgr_tool_calling_agent.py:116-125`), which production does not use.
+  - Consequently an agent terminates **only** by calling a terminal `SystemBaseTool` — in
+    practice `FinalAnswerTool` (`tools/final_answer_tool.py:33-36`), which sets
+    `context.state = COMPLETED/FAILED`. The loop exits at the top-of-loop guard
+    `state not in FINISH_STATES` (`base_agent.py:503`).
+  - **So "the router answered itself" is not an empty turn — it is the router calling
+    `FinalAnswerTool` directly with zero prior non-system tool calls.** The right metric is:
+    number of executed tools whose `isSystemTool == False`.
+  - **`isSystemTool` is the clean discriminator** (`base_tool.py:35`; set `True` on
+    `SystemBaseTool` at `:55`). Work/MCP/sub-agent tools are `False`; terminal/system tools
+    (`FinalAnswerTool`, `ClarificationTool`, `ReasoningTool`) are `True`. Count tools with
+    `isSystemTool == False` to detect "router finished without delegating."
 
 ---
 
@@ -216,10 +222,15 @@ Proposed seams (each maps to an existing call site):
 |---|---|---|---|
 | `on_prepare_tools(toolkit, counters, ctx, cfg)` | inside `_prepare_tools` `base_agent.py:223` | drop tools from the offered set | **Issue 1** |
 | `on_tool_end(tool_name, tool_args, result, ...)` | `base_agent.py:337` (already a metrics seam) | update per-run counters | **Issue 1** bookkeeping |
-| `on_before_finish(state, ctx, cfg, tool_calls_this_run)` | new seam before accepting `FINISH_STATES` at `base_agent.py:503/519` | veto finish → inject message + `force_continue` | **Issue 2** |
+| `on_before_finish(state, ctx, cfg, work_calls_this_run)` | new seam: after `_execution_step` drives `state ∈ FINISH_STATES`, before the loop re-checks at `base_agent.py:503/517` | veto finish → inject message + `force_continue` | **Issue 2** |
 
 `on_before_finish` is the only genuinely new interception point; the loop currently has no
-"the agent wants to stop — should we let it?" hook. Everything else reuses existing seams.
+"the agent wants to stop — should we let it?" hook. It fires when a terminal `SystemBaseTool`
+(`FinalAnswerTool`) has just set a finish state; to veto, the loop resets `state` back to a
+non-finish "resume" state (identify the exact enum member in the plan — see
+`AgentStatesEnum`/`FINISH_STATES`, `models.py:35-44`) and appends the corrective message to
+`self.conversation`. `work_calls_this_run` = count of executed tools with
+`isSystemTool == False`. Everything else reuses existing seams.
 
 ### 3.3 The two issues as built-in processors
 
@@ -229,9 +240,10 @@ Proposed seams (each maps to an existing call site):
   tool (`FinalAnswerTool`), or the agent can't end. Decide whether to also inject a
   "tool X disabled after N repeats" note so the model understands the toolkit shrank.
 - **`MandatoryToolCallProcessor`** (Issue 2, router enforcement). `on_before_finish`: if
-  `tool_calls_this_run == 0` (excluding the final-answer tool) and retries-used <
-  `max_retries`, inject the corrective message and `force_continue=True`. Config:
-  `{min_tool_calls: 1, max_retries: 2}`. Per-agent: enabled only on routers.
+  `work_calls_this_run < min_tool_calls` (work calls = executed tools with
+  `isSystemTool == False`; the terminal `FinalAnswerTool` is a system tool and does not count)
+  and retries-used < `max_retries`, inject the corrective message and `force_continue=True`.
+  Config: `{min_tool_calls: 1, max_retries: 2}`. Per-agent: enabled only on routers.
 
 ### 3.4 Why this is the right generalization
 
@@ -267,8 +279,9 @@ already knows.
 
 See `plans/gaps/agent-context-processors.md`. Summary:
 
-- How does the **production `ToolCallingAgent`** (reasoning disabled) actually terminate a
-  zero-tool-call turn? The Issue-2 trigger depends on it (§2.4).
+- ~~How does the production `ToolCallingAgent` terminate a zero-tool-call turn?~~ **Resolved
+  (2026-06-13):** `tool_choice="required"` → always terminates via `FinalAnswerTool`; "router
+  answered itself" = terminal call with zero `isSystemTool==False` work calls (§2.4).
 - Should Issue-1 dedup count **all** repeats or only **failed** (`Error:`-prefixed) repeats?
 - "Drop a tool" vs "inject a stop-repeating instruction" — which does the LLM handle better?
   (Dropping is deterministic; instructing is softer but keeps capability.)
