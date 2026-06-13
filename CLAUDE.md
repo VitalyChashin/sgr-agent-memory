@@ -94,6 +94,10 @@ research (if required) → plan → implementation
                     gaps/ + notes/ (filed at any phase)
 ```
 
+> **`main` is locked — never commit to it.** Always create a feature branch
+> (`NNN-feature-name`, matching the spec number) and land work there. `main`
+> tracks the remote; changes reach it only through a reviewed PR/merge.
+
 1. **Research** — investigate unknowns before committing to an approach. Output: `research/<topic>.md`.
 2. **Plan** — write an implementation plan before touching code. Output: `plans/<feature>.md`.
 3. **Implementation** — execute the plan, following the session start protocol in the affected repo's `CLAUDE.md`.
