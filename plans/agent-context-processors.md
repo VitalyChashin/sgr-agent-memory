@@ -2,7 +2,7 @@
 title: Implementation plan — Agent Context Processor plugin system
 status: active
 created: 2026-06-13
-updated: 2026-06-13
+updated: 2026-06-13  # added optional per-processor Langfuse span emission
 owner: Vitaly Chashin
 supersedes: []
 related:
@@ -57,6 +57,14 @@ The chain is built **once per run** (like `build_metrics_chain`, `base_agent.py:
 processor instances hold per-request state (call-count maps, retry counters) with no
 cross-request leakage. Stored on `self._context_chain` so the seam methods can reach it.
 
+**Observability is optional, per-processor.** The base contract emits nothing. Instead, every
+hook is *offered* the active `provider` (`get_provider()`) and a parent span handle via kwargs;
+a processor that wants monitoring emits its own span, one that doesn't ignores them. Because a
+`NoOpProvider` (`observability/noop.py:12`) is always returned when Langfuse is disabled,
+emitting code needs no `if enabled` guards — `start_span`/`end_span` become no-ops. The two
+built-ins use this to emit a span **only when they actually fire** (a tool is dropped / a
+finish is vetoed).
+
 ## 3. Module layout
 
 New package `sgr_agent_core/context_processors/` mirroring `observability/metrics/`:
@@ -94,7 +102,8 @@ class AgentContextProcessor(ABC):
         if not getattr(cls, "__abstractmethods__", set()):
             AgentContextProcessorRegistry.register(cls, name=cls.__name__)
 
-    # all hooks optional, default no-op
+    # all hooks optional, default no-op.
+    # **kw always includes `provider` (ObservabilityProvider) and `parent_span` (handle|None).
     async def on_tool_end(self, *, tool: BaseTool, result: str,
                           context: AgentContext, config: AgentConfig, **kw) -> None: ...
     async def on_prepare_tools(self, *, toolkit: list[type[BaseTool]],
@@ -105,9 +114,13 @@ class AgentContextProcessor(ABC):
         return None
 ```
 
-> Note: `on_tool_end` receives the **tool instance** (not just the name as metrics does), so
-> processors can read `tool.isSystemTool` and `tool.model_dump(mode="json")` for counting and
-> hashing.
+> Notes:
+> - `on_tool_end` receives the **tool instance** (not just the name as metrics does), so
+>   processors can read `tool.isSystemTool` and `tool.model_dump(mode="json")` for counting and
+>   hashing.
+> - Every hook also receives `provider` and `parent_span` in `**kw` for **optional** span
+>   emission. The base class itself emits nothing — observability is a capability a processor
+>   opts into, not part of the contract. A small helper keeps it one line (§7.3).
 
 ### 4.3 Config model & registry
 
@@ -126,24 +139,28 @@ class AgentContextProcessorChain:
     def __init__(self, processors: list[AgentContextProcessor]):
         self.processors = processors
 
-    async def run_on_tool_end(self, tool, result, context, config) -> None:
+    # provider + parent_span are forwarded to every hook for optional span emission.
+    async def run_on_tool_end(self, tool, result, context, config, *, provider, parent_span) -> None:
         for p in self.processors:
-            try: await p.on_tool_end(tool=tool, result=result, context=context, config=config)
+            try: await p.on_tool_end(tool=tool, result=result, context=context, config=config,
+                                     provider=provider, parent_span=parent_span)
             except Exception as e: logger.warning("ctx-proc %s.on_tool_end failed: %s", type(p).__name__, e)
 
-    async def run_prepare_tools(self, toolkit, context, config) -> set[str]:
+    async def run_prepare_tools(self, toolkit, context, config, *, provider, parent_span) -> set[str]:
         drop: set[str] = set()
         for p in self.processors:
-            try: drop |= await p.on_prepare_tools(toolkit=toolkit, context=context, config=config)
+            try: drop |= await p.on_prepare_tools(toolkit=toolkit, context=context, config=config,
+                                                  provider=provider, parent_span=parent_span)
             except Exception as e: logger.warning(...)  # fail-safe: this processor drops nothing
         # NEVER drop system/terminal tools — agent must be able to finish
         system_names = {t.tool_name for t in toolkit if getattr(t, "isSystemTool", False)}
         return drop - system_names
 
-    async def run_before_finish(self, context, config) -> FinishDecision:
+    async def run_before_finish(self, context, config, *, provider, parent_span) -> FinishDecision:
         merged = FinishDecision()
         for p in self.processors:
-            try: d = await p.on_before_finish(context=context, config=config)
+            try: d = await p.on_before_finish(context=context, config=config,
+                                              provider=provider, parent_span=parent_span)
             except Exception as e: logger.warning(...); continue   # fail-safe: allow finish
             if d and d.force_continue:
                 merged.force_continue = True
@@ -206,8 +223,11 @@ agents:
 
 ## 6. BaseAgent wiring (three diffs)
 
-Add `self._context_chain: AgentContextProcessorChain | None = None` in `__init__`
-(`base_agent.py:~53`).
+Add `self._context_chain: AgentContextProcessorChain | None = None` and
+`self._current_iter_span = None` in `__init__` (`base_agent.py:~53`). Set
+`self._current_iter_span = iter_span` at the top of the loop body (right after the iteration
+span is created, `base_agent.py:~514`) so `_prepare_tools` — which runs deeper in the call
+stack without `iter_span` in scope — can pass it as the parent for emitted spans.
 
 **Diff A — build the chain (in `_execute`, near `base_agent.py:442`):**
 ```python
@@ -221,7 +241,9 @@ tools = set(self.toolkit)
 if self._context.iteration >= self.config.execution.max_iterations:
     raise RuntimeError("Max iterations reached")
 if self._context_chain:
-    drop = await self._context_chain.run_prepare_tools(list(self.toolkit), self._context, self.config)
+    drop = await self._context_chain.run_prepare_tools(
+        list(self.toolkit), self._context, self.config,
+        provider=get_provider(), parent_span=self._current_iter_span)
     tools = {t for t in tools if t.tool_name not in drop}
 return [pydantic_function_tool(tool, name=tool.tool_name) for tool in tools]
 ```
@@ -230,13 +252,16 @@ return [pydantic_function_tool(tool, name=tool.tool_name) for tool in tools]
 - After the tool executes (`base_agent.py:331`, alongside the metrics `on_tool_end` at `:337`):
   ```python
   if self._context_chain:
-      await self._context_chain.run_on_tool_end(action_tool, tool_result, self._context, self.config)
+      await self._context_chain.run_on_tool_end(
+          action_tool, tool_result, self._context, self.config,
+          provider=provider, parent_span=tool_span)   # provider/tool_span already in scope here
   ```
 - The new finish seam in the loop body, after `_execution_step` returns and before the
   `while` re-check (`base_agent.py:517`):
   ```python
   if self._context_chain and self._context.state in AgentStatesEnum.FINISH_STATES.value:
-      decision = await self._context_chain.run_before_finish(self._context, self.config)
+      decision = await self._context_chain.run_before_finish(
+          self._context, self.config, provider=provider, parent_span=iter_span)
       if decision.force_continue:
           for m in decision.inject_messages:
               self.conversation.append(m)
@@ -262,6 +287,9 @@ State: `self._counts: dict[str, int]`. Config: `max_repeats: int = 3`,
 - `on_prepare_tools`: return `{tool_name for any key ≥ max_repeats}` → resolves to the set of
   tool names whose (name|name+args) count crossed the threshold. (For `exact_args`, map the
   crossed key back to its `tool_name`, stored alongside the count.)
+- **Span (on fire):** when it returns a non-empty drop set, emit one span per dropped tool via
+  the §7.3 helper — `name="ctx-processor.repeated_tool_call_guard.dropped"`, metadata
+  `{tool, count, scope, iteration}`, parented under `parent_span`.
 
 > Decision (gap #3): v1 = **drop the tool** (deterministic). Optionally also inject a one-line
 > system note "tool X disabled after N repeats" so the model understands the shrink — gate with
@@ -275,9 +303,31 @@ State: `self._work_calls: int = 0`, `self._retries: int = 0`. Config:
 
 - `on_tool_end`: if `not tool.isSystemTool`: `self._work_calls += 1`.
 - `on_before_finish`: if `self._work_calls < min_tool_calls and self._retries < max_retries`:
-  `self._retries += 1`; return
+  `self._retries += 1`; **emit a span** (§7.3) —
+  `name="ctx-processor.mandatory_tool_call.vetoed"`, metadata
+  `{work_calls, min_tool_calls, retry: self._retries, iteration}` — then return
   `FinishDecision(force_continue=True, inject_messages=[{"role": "user", "content": self.message}], reason="router finished with no work calls")`.
   Else return `None` (allow finish; safety valve avoids infinite veto).
+
+### 7.3 Optional emission helper
+
+A tiny utility built-ins use; **not** referenced by the base class. Lives in
+`context_processors/base.py`:
+
+```python
+def emit_event_span(provider, parent_span, name: str, metadata: dict[str, Any]) -> None:
+    """Emit a zero-duration event span. No-op under NoOpProvider, so always safe to call."""
+    if provider is None:
+        return
+    span = provider.start_span(name=name, span_type="event", input=metadata,
+                               metadata=metadata, _parent=parent_span)
+    provider.end_span(span, output=metadata)
+```
+
+Confirm the `span_type="event"` value against `provider.start_span` (`provider.py:51`,
+`langfuse_provider.py:106`) — fall back to `"span"` if `"event"` is not a supported type.
+Because `get_provider()` returns `NoOpProvider` when observability is off
+(`observability/noop.py:12`), the helper is unconditionally safe; no `enabled` checks.
 
 ## 8. Fail policy (gap #6, decided)
 
@@ -300,6 +350,9 @@ Mirror `tests/test_payload_processor.py` / `tests/test_builtin_processors.py`.
   `tool_name`; threshold drop; `failed_only`; system tools never counted/dropped.
 - `tests/context_processors/test_mandatory_tool_call.py` — veto when 0 work calls; allow after
   `max_retries`; system tools don't satisfy `min_tool_calls`.
+- **Emission:** with a fake provider that records `start_span` calls, assert a span is emitted
+  exactly when a tool is dropped / a finish is vetoed, and **not** emitted otherwise; assert a
+  `NoOpProvider` makes built-ins run without error (no emission, no crash).
 - `tests/context_processors/test_loop_integration.py` — drive a `ToolCallingAgent` with a fake
   client: (1) leaf repeatedly calling a stub tool that returns `Error:` → tool dropped → agent
   finishes instead of looping to `max_iterations`; (2) router that calls `FinalAnswerTool`
@@ -307,12 +360,14 @@ Mirror `tests/test_payload_processor.py` / `tests/test_builtin_processors.py`.
 
 ## 10. Task breakdown
 
-1. `context_processors/base.py` — ABC, registry, definition, chain, directives, builder. [P]
+1. `context_processors/base.py` — ABC, registry, definition, chain, directives, builder,
+   `emit_event_span` helper. [P]
 2. `context_processors/__init__.py` — exports + builtin imports. (after 1)
-3. `RepeatedToolCallGuard`. [P after 1]
-4. `MandatoryToolCallProcessor`. [P after 1]
+3. `RepeatedToolCallGuard` + drop-span emission. [P after 1]
+4. `MandatoryToolCallProcessor` + veto-span emission. [P after 1]
 5. `AgentConfig.context_processors` field + validate it threads through per-agent override. [P]
-6. BaseAgent diffs A/B/C + `_context_chain` attribute. (after 1)
+6. BaseAgent diffs A/B/C + `_context_chain` / `_current_iter_span` attributes; pass
+   `provider`/`parent_span` into all three chain calls. (after 1)
 7. Unit tests for base + both builtins. (after 3,4)
 8. Loop integration test. (after 6)
 9. `config.yaml.example` snippet + short docs in CLAUDE.md MCP/processors area.
