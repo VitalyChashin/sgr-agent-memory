@@ -86,14 +86,22 @@ sgrsh                      # Interactive CLI
 - **Tool naming:** `snake_case` for `tool_name`, `PascalCase` for class names. Auto-conversion supported.
 - **Imports:** Tools and agents must be imported within project scope to appear in registries.
 
-## Spec-Driven Development
+## Workflow
 
-This project uses GitHub Spec Kit for feature development. All new features follow the workflow:
+```
+research (if required) → plan → implementation
+         ↓                ↓           ↓
+                    gaps/ + notes/ (filed at any phase)
+```
 
-1. Read the constitution at `.specify/memory/constitution.md`
-2. Specs live in `specs/NNN-feature-name/spec.md`
-3. Plans live alongside specs as `plan.md`
-4. Tasks live as `tasks.md`
-5. Use `/speckit.*` slash commands to drive the workflow
-
-When implementing tasks from `tasks.md`, work through them sequentially unless marked `[P]` (parallelizable). Each task is scoped to be implementable and testable in isolation.
+1. **Research** — investigate unknowns before committing to an approach. Output: `research/<topic>.md`.
+2. **Plan** — write an implementation plan before touching code. Output: `plans/<feature>.md`.
+3. **Implementation** — execute the plan, following the session start protocol in the affected repo's `CLAUDE.md`.
+4. **Gaps** — whenever a gap is noticed (missing spec, unresolved ambiguity, out-of-scope dependency, deferred decision), add a short note to `plans/gaps/<topic>.md`. File gaps at any phase, not just at the end.
+5. **Notes** — whenever you hit a durable caveat, gotcha, or non-obvious decision that is **resolved** but worth remembering (a sharp edge, a deliberate choice and its reason), file it to `notes/<topic>.md`. This is a standing rule: keep documenting these as they come up. Gaps are *unresolved/missing*; notes are *settled but worth remembering* — if it's a gap, it goes to `plans/gaps/`, not here. See `notes/README.md`.
+6. **Completion** — express lifecycle via the doc's `status:` frontmatter, **not** by moving files (GitMark model; see `notes/gitmark-ontology.md`):
+   - Research acted on → set `status: archived` (+ bump `updated:`).
+   - Plan fully implemented → set `status: archived`.
+   - Gap resolved → set `status: archived` (keep the node so its links survive) rather than deleting.
+   - A replacement doc declares `supersedes: [old.md]` (target must already be `deprecated|archived`).
+   - **Do not create new `completed/` folders.** The existing `research/completed/` and `plans/completed/` are grandfathered (already carry `status: archived`) — leave them in place, but file new work at the folder root.

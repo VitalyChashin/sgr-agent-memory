@@ -34,6 +34,14 @@ class BaseStreamingGenerator(StreamingGeneratorRegistryMixin):
     def add(self, data: str):
         self.queue.put_nowait(data)
 
+    def add_metadata_event(self, data: dict):
+        """Emit an SSE named event carrying sideband metadata.
+
+        The ``event: metadata`` prefix causes OpenAI-compatible clients
+        (which only listen for unnamed ``data:`` lines) to ignore it.
+        """
+        self.queue.put_nowait(f"event: metadata\ndata: {json.dumps(data)}\n\n")
+
     def add_done(self):
         """Adds [DONE] marker without finishing the stream."""
         self.queue.put_nowait("data: [DONE]\n\n")
