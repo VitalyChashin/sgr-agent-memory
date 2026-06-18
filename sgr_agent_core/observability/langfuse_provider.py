@@ -162,10 +162,16 @@ class LangfuseProvider(ObservabilityProvider):
         *,
         output: dict[str, Any] | None = None,
         status: str | None = None,
+        tags: list[str] | None = None,
     ) -> None:
         try:
             if isinstance(handle, LangfuseTraceHandle) and handle.trace is not None:
-                handle.trace.update(output=output, status_message=status)
+                # trace.update(tags=...) replaces the tag list, so callers pass the
+                # full merged set (start-time tags + error tags).
+                update_kwargs: dict[str, Any] = {"output": output, "status_message": status}
+                if tags:
+                    update_kwargs["tags"] = tags
+                handle.trace.update(**update_kwargs)
         except Exception as e:
             logger.warning("Langfuse end_trace failed (non-fatal): %s: %s", type(e).__name__, e)
 

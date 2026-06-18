@@ -79,8 +79,9 @@ class ObservabilityProvider(ABC):
         *,
         output: dict[str, Any] | None = None,
         status: str | None = None,
+        tags: list[str] | None = None,
     ) -> None:
-        """End the root trace."""
+        """End the root trace. ``tags`` replaces the trace's tag list (merge upstream)."""
         ...
 
     @abstractmethod

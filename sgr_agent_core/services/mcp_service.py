@@ -53,7 +53,9 @@ class MCP2ToolConverter:
                         f"Processor '{defn.class_name}' not found in registry and cannot be imported: {e}"
                     ) from e
 
-            processors.append(processor_cls(defn.config))
+            proc = processor_cls(defn.config)
+            proc._span_mode = defn.span_mode
+            processors.append(proc)
 
         chain = MCPPayloadProcessorChain(processors) if processors else None
         return chain, all_managed_fields

@@ -113,12 +113,21 @@ agents:
   #   - MandatoryToolCallProcessor: vetoes a finish that happens before
   #     `min_tool_calls` work-tool calls (stops a router "answering itself"),
   #     up to `max_retries` times.
+  #
+  # Optional per-entry `span_mode` controls Langfuse span emission for that
+  # processor (default "fired"):
+  #   - "off":    emit nothing (provider withheld; even fired-action markers silent).
+  #   - "fired":  only emit a marker span when the processor actually acts
+  #               (a tool dropped / a finish vetoed). Default — lowest volume.
+  #   - "always": additionally wrap every invocation in a timed span (shows the
+  #               processor ran even when it took no action). Higher span volume.
   router_agent:
     base_class: "ToolCallingAgent"
     tools:
       - "final_answer_tool"
     context_processors:
       - class: "MandatoryToolCallProcessor"
+        span_mode: "always"   # off | fired (default) | always
         config:
           min_tool_calls: 1
           max_retries: 2

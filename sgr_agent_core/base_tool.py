@@ -8,6 +8,7 @@ from fastmcp import Client
 from pydantic import BaseModel
 
 from sgr_agent_core.agent_config import GlobalConfig
+from sgr_agent_core.observability.context import mcp_call_errored
 from sgr_agent_core.services.registry import ToolRegistry
 
 if TYPE_CHECKING:
@@ -66,12 +67,22 @@ class MCPBaseTool(BaseTool):
     _managed_fields: ClassVar[list[str]] = []
 
     async def __call__(self, context: AgentContext, config: AgentConfig, **kwargs) -> str:
+        from sgr_agent_core.observability import get_provider
+        from sgr_agent_core.observability.context import current_tool_span
+
         global_config = GlobalConfig()
         payload = self.model_dump(mode="json")
 
+        # Provider + active tool span (set by BaseAgent) so payload-processor spans
+        # nest under the MCP call they wrap. Both safe/no-op when unset.
+        provider = get_provider()
+        parent_span = current_tool_span.get()
+
         # Apply processor chain before MCP call
         if self._processor_chain:
-            payload = await self._processor_chain.run_pre_call(payload, context, config, **kwargs)
+            payload = await self._processor_chain.run_pre_call(
+                payload, context, config, provider=provider, parent_span=parent_span, **kwargs
+            )
 
         try:
             async with self._client:
@@ -83,12 +94,17 @@ class MCPBaseTool(BaseTool):
                 # Apply processor chain after MCP call
                 if self._processor_chain:
                     result_str = await self._processor_chain.run_post_call(
-                        result_str, payload, context, config, **kwargs
+                        result_str, payload, context, config, provider=provider, parent_span=parent_span, **kwargs
                     )
 
                 return result_str
         except Exception as e:
             logger.error(f"Error processing MCP tool {self.tool_name}: {e}")
+            # The error is swallowed into the result string so the loop continues, but
+            # we still mark it for Langfuse: tag the trace (filterable) and flag the
+            # tool span so the agent loop can set it to ERROR level.
+            context.error_tags.update({"error", "error:mcp_tool"})
+            mcp_call_errored.set(True)
             return f"Error: {e}"
 
     @classmethod

@@ -78,10 +78,15 @@ mcp:
     #   url: "https://your-mcp-server.com/mcp"
     #   headers:
     #     Authorization: "Bearer your-token"
-    #   # Payload processors: transform outgoing MCP call payloads
+    #   # Payload processors: transform outgoing MCP call payloads.
+    #   # Optional per-entry `span_mode` controls Langfuse spans for that processor:
+    #   #   "off" (default, no spans) | "always" (wrap each pre_call/post_call in a
+    #   #   timed span nested under the MCP tool span). Default is "off" because
+    #   #   payload processors run on every MCP call.
     #   payload_processors:
     #     - class: "TraceContextProcessor"
     #       managed_fields: ["traceId"]  # Hidden from LLM schema
+    #       span_mode: "always"          # off (default) | always
     #       config:
     #         default_trace_id: "trace-system-001"
     #     - class: "AuthContextProcessor"

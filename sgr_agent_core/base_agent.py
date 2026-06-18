@@ -13,6 +13,7 @@ from pydantic import BaseModel
 
 from sgr_agent_core.agent_definition import AgentConfig, ToolDefinition
 from sgr_agent_core.models import AgentContext, AgentStatesEnum
+from sgr_agent_core.observability.context import current_tool_span, mcp_call_errored
 from sgr_agent_core.services.prompt_loader import PromptLoader
 from sgr_agent_core.services.registry import AgentRegistry
 from sgr_agent_core.stream import BaseStreamingGenerator, OpenAIStreamingGenerator
@@ -21,6 +22,17 @@ from sgr_agent_core.tools import (
     ClarificationTool,
     ReasoningTool,
 )
+
+
+def _classify_error_tags(exc: BaseException) -> set[str]:
+    """Map a fatal loop exception to Langfuse-filterable error tags.
+
+    ``RuntimeError("Max iterations reached")`` is the max-steps crash; everything
+    else that bubbles to the loop's handler is an LLM/tool failure.
+    """
+    if isinstance(exc, RuntimeError) and str(exc).startswith("Max iterations reached"):
+        return {"error", "error:max_steps"}
+    return {"error", "error:llm"}
 
 
 class AgentRegistryMixin:
@@ -345,10 +357,22 @@ class BaseAgent(AgentRegistryMixin):
             _parent=iter_span,
         )
         try:
-            tool_result = await self._action_phase(action_tool)
+            # Expose the tool span so MCP payload-processor spans (inside the tool's
+            # __call__) can nest under it. Reset exactly once, success or error.
+            _span_token = current_tool_span.set(tool_span)
+            try:
+                tool_result = await self._action_phase(action_tool)
+            finally:
+                current_tool_span.reset(_span_token)
+            # An MCP tool error is swallowed into the result string (the loop continues),
+            # but the tool layer flags it so we still mark the span ERROR for filtering.
+            mcp_errored = mcp_call_errored.get()
+            mcp_call_errored.set(False)
             provider.end_span(
                 tool_span,
                 output={"result": self._truncate(tool_result)},
+                level="ERROR" if mcp_errored else "DEFAULT",
+                status="MCP tool returned an error" if mcp_errored else None,
             )
             if metrics_chain:
                 await metrics_chain.run_hook(
@@ -634,6 +658,9 @@ class BaseAgent(AgentRegistryMixin):
                 trace,
                 output=trace_output,
                 status=final_status,
+                # Merge any swallowed-error tags (e.g. an MCP 500) so a run that ends
+                # "completed" is still filterable as error:mcp_tool.
+                tags=trace_tags + sorted(self._context.error_tags),
             )
             self._flush_provider_async(provider)
             return self._context.execution_result
@@ -648,7 +675,13 @@ class BaseAgent(AgentRegistryMixin):
         except Exception as e:
             self.logger.error(f"❌ Agent execution error: {str(e)}")
             self._context.state = AgentStatesEnum.FAILED
-            provider.end_trace(trace, output={"error": str(e)}, status=f"failed: {e}")
+            err_tags = self._context.error_tags | _classify_error_tags(e)
+            provider.end_trace(
+                trace,
+                output={"error": str(e)},
+                status=f"failed: {e}",
+                tags=trace_tags + sorted(err_tags),
+            )
             self._flush_provider_async(provider)
             traceback.print_exc()
         finally:

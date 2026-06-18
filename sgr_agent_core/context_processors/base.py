@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, Field
 
+from sgr_agent_core.observability.context import processor_span_end, processor_span_start
 from sgr_agent_core.services.registry import Registry
 
 if TYPE_CHECKING:
@@ -65,6 +66,11 @@ class AgentContextProcessor(ABC):
     and ``parent_span`` (a span handle or ``None``) in ``**kw`` for *optional*
     span emission via :func:`emit_event_span`. The base class emits nothing.
     """
+
+    #: Span emission mode, set per-processor by ``build_context_processor_chain``.
+    #: "off" → no spans (provider withheld); "fired" → only fired-action markers
+    #: (default, today's behaviour); "always" → also wrap every invocation in a span.
+    _span_mode: str = "fired"
 
     def __init__(self, processor_config: dict[str, Any] | None = None):
         self.processor_config = processor_config or {}
@@ -114,6 +120,22 @@ class AgentContextProcessorChain:
     def __init__(self, processors: list[AgentContextProcessor]):
         self.processors = processors
 
+    @staticmethod
+    def _span_setup(p: AgentContextProcessor, provider: Any, parent_span: Any, hook: str) -> tuple[Any, Any]:
+        """Resolve the effective provider + wrapping span for one processor invocation.
+
+        ``span_mode`` "off" withholds the provider (so the processor's own
+        ``emit_event_span`` markers also fall silent); "always" opens a timed wrapping
+        span; "fired" (default) leaves today's behaviour untouched.
+        """
+        mode = getattr(p, "_span_mode", "fired")
+        if mode == "off":
+            return None, None
+        span = None
+        if mode == "always":
+            span = processor_span_start(provider, parent_span, name=f"ctx-processor.{type(p).__name__}.{hook}")
+        return provider, span
+
     async def run_on_tool_end(
         self,
         tool: BaseTool,
@@ -125,16 +147,19 @@ class AgentContextProcessorChain:
         parent_span: Any = None,
     ) -> None:
         for p in self.processors:
+            p_provider, span = self._span_setup(p, provider, parent_span, "on_tool_end")
             try:
                 await p.on_tool_end(
                     tool=tool,
                     result=result,
                     context=context,
                     config=config,
-                    provider=provider,
+                    provider=p_provider,
                     parent_span=parent_span,
                 )
+                processor_span_end(p_provider, span)
             except Exception as e:
+                processor_span_end(p_provider, span, output={"error": str(e)}, level="ERROR")
                 logger.warning("ctx-proc %s.on_tool_end failed: %s: %s", type(p).__name__, type(e).__name__, e)
 
     async def run_prepare_tools(
@@ -148,16 +173,20 @@ class AgentContextProcessorChain:
     ) -> set[str]:
         drop: set[str] = set()
         for p in self.processors:
+            p_provider, span = self._span_setup(p, provider, parent_span, "on_prepare_tools")
             try:
-                drop |= await p.on_prepare_tools(
+                dropped = await p.on_prepare_tools(
                     toolkit=toolkit,
                     context=context,
                     config=config,
-                    provider=provider,
+                    provider=p_provider,
                     parent_span=parent_span,
                 )
+                drop |= dropped
+                processor_span_end(p_provider, span, output={"dropped": sorted(dropped)})
             except Exception as e:
                 # Fail-safe: this processor contributes no drops, agent keeps full toolkit.
+                processor_span_end(p_provider, span, output={"error": str(e)}, level="ERROR")
                 logger.warning("ctx-proc %s.on_prepare_tools failed: %s: %s", type(p).__name__, type(e).__name__, e)
         # NEVER drop system/terminal tools — the agent must always be able to finish.
         system_names = {t.tool_name for t in toolkit if getattr(t, "isSystemTool", False)}
@@ -173,17 +202,20 @@ class AgentContextProcessorChain:
     ) -> FinishDecision:
         merged = FinishDecision()
         for p in self.processors:
+            p_provider, span = self._span_setup(p, provider, parent_span, "on_before_finish")
             try:
                 d = await p.on_before_finish(
                     context=context,
                     config=config,
-                    provider=provider,
+                    provider=p_provider,
                     parent_span=parent_span,
                 )
             except Exception as e:
                 # Fail-safe: a throwing veto lets the agent finish (never loop forever).
+                processor_span_end(p_provider, span, output={"error": str(e)}, level="ERROR")
                 logger.warning("ctx-proc %s.on_before_finish failed: %s: %s", type(p).__name__, type(e).__name__, e)
                 continue
+            processor_span_end(p_provider, span, output={"force_continue": bool(d and d.force_continue)})
             if d and d.force_continue:
                 merged.force_continue = True
                 merged.inject_messages.extend(d.inject_messages)
@@ -195,6 +227,11 @@ class ContextProcessorDefinition(BaseModel, extra="allow"):
 
     class_name: str = Field(alias="class", description="Processor class name or import string")
     config: dict[str, Any] = Field(default_factory=dict)
+    span_mode: str = Field(
+        default="fired",
+        description="Span emission: 'off' (none), 'fired' (only fired-action markers, default), "
+        "'always' (also wrap every invocation in a timed span).",
+    )
 
 
 def build_context_processor_chain(config: AgentConfig) -> AgentContextProcessorChain | None:
@@ -232,7 +269,9 @@ def build_context_processor_chain(config: AgentConfig) -> AgentContextProcessorC
                 )
                 continue
         try:
-            processors.append(cls(defn.config))
+            proc = cls(defn.config)
+            proc._span_mode = defn.span_mode
+            processors.append(proc)
         except Exception as e:
             logger.warning("Failed to initialize context processor '%s': %s. Skipping.", defn.class_name, e)
 
