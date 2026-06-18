@@ -132,6 +132,19 @@ class PromptsConfig(BaseModel, extra="allow"):
         )
 
 
+class MCPRetryConfig(BaseModel):
+    """Retry policy for transient MCP connection/transport failures."""
+
+    attempts: int = Field(default=3, ge=1, description="Total MCP connect tries (1 disables retry)")
+    base_delay: float = Field(default=0.5, gt=0, description="First backoff delay in seconds")
+    max_delay: float = Field(default=8.0, gt=0, description="Backoff ceiling in seconds")
+    backoff_factor: float = Field(default=2.0, ge=1.0, description="Exponential backoff multiplier")
+    degrade_on_build_failure: bool = Field(
+        default=False,
+        description="If True, a failed MCP tool build logs a warning and returns non-MCP tools instead of raising",
+    )
+
+
 class ExecutionConfig(BaseModel, extra="allow"):
     """Execution parameters and limits for agents.
 
@@ -141,6 +154,9 @@ class ExecutionConfig(BaseModel, extra="allow"):
     max_clarifications: int = Field(default=3, ge=0, description="Maximum number of clarifications")
     max_iterations: int = Field(default=10, gt=0, description="Maximum number of iterations")
     mcp_context_limit: int = Field(default=15000, gt=0, description="Maximum context length from MCP server response")
+    mcp_retry: MCPRetryConfig = Field(
+        default_factory=MCPRetryConfig, description="Retry policy for transient MCP connection failures"
+    )
 
     streaming_generator: Literal["openai", "open_webui"] = Field(
         default="openai",

@@ -10,6 +10,7 @@ from pydantic import BaseModel
 from sgr_agent_core.agent_config import GlobalConfig
 from sgr_agent_core.observability.context import mcp_call_errored
 from sgr_agent_core.services.registry import ToolRegistry
+from sgr_agent_core.services.retry import RetryPolicy, with_mcp_retry
 
 if TYPE_CHECKING:
     from sgr_agent_core.agent_definition import AgentConfig
@@ -84,20 +85,33 @@ class MCPBaseTool(BaseTool):
                 payload, context, config, provider=provider, parent_span=parent_span, **kwargs
             )
 
-        try:
+        async def _invoke() -> str:
             async with self._client:
                 result = await self._client.call_tool(self.tool_name, payload)
-                result_str = json.dumps([m.model_dump_json() for m in result.content], ensure_ascii=False)[
+                return json.dumps([m.model_dump_json() for m in result.content], ensure_ascii=False)[
                     : global_config.execution.mcp_context_limit
                 ]
 
-                # Apply processor chain after MCP call
-                if self._processor_chain:
-                    result_str = await self._processor_chain.run_post_call(
-                        result_str, payload, context, config, provider=provider, parent_span=parent_span, **kwargs
-                    )
+        retry_cfg = global_config.execution.mcp_retry
+        policy = RetryPolicy(
+            attempts=retry_cfg.attempts,
+            base_delay=retry_cfg.base_delay,
+            max_delay=retry_cfg.max_delay,
+            backoff_factor=retry_cfg.backoff_factor,
+        )
 
-                return result_str
+        try:
+            # Retry wraps only the connect+call (transient transport errors); the
+            # processor chain runs once on the final successful result.
+            result_str = await with_mcp_retry(_invoke, policy, what=f"call_tool({self.tool_name})")
+
+            # Apply processor chain after MCP call
+            if self._processor_chain:
+                result_str = await self._processor_chain.run_post_call(
+                    result_str, payload, context, config, provider=provider, parent_span=parent_span, **kwargs
+                )
+
+            return result_str
         except Exception as e:
             logger.error(f"Error processing MCP tool {self.tool_name}: {e}")
             # The error is swallowed into the result string so the loop continues, but

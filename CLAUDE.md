@@ -60,6 +60,8 @@ sgr_agent_core/           # Core Python package
 
 MCP servers are configured in `config.yaml` under `mcp.mcpServers`. MCP tools use `MCPBaseTool` which handles calls through the MCP client and converts them to the framework's tool format. The framework uses `fastmcp` ≥ 2.12.4 for MCP server integration.
 
+**Connection retry.** Both MCP connect points retry transient transport errors (connection refused/reset, timeouts, broken sessions) per `execution.mcp_retry` (bounded exponential backoff; `services/retry.py`). Genuine tool errors (`ToolError`/`FastMCPError`) are **never** retried. **Build** (`build_tools_from_mcp`) re-raises after retries (fatal startup) unless `mcp_retry.degrade_on_build_failure: true`, which skips MCP tools instead. **Call** (`MCPBaseTool.__call__`) retries then, on final failure, swallows the error into the result string so the loop continues. The payload processor's `pre_call`/`post_call` run **once**, outside the retry loop. See `notes/mcp-retry.md`.
+
 ## Processor Plugins
 
 Three processor-plugin families share one skeleton (auto-registering ABC + `*Definition` + `*Chain` + registry-then-import-string resolution; see `notes/processor-plugin-pattern.md`):

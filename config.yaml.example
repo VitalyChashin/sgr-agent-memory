@@ -15,6 +15,12 @@ execution:
   max_clarifications: 3  # Max clarification requests
   max_iterations: 10  # Max agent iterations
   mcp_context_limit: 15000  # Max context length from MCP server response
+  mcp_retry:  # Retry policy for transient MCP connection/transport failures
+    attempts: 3  # Total connect tries (1 disables retry)
+    base_delay: 0.5  # First backoff delay (seconds)
+    max_delay: 8.0  # Backoff ceiling (seconds)
+    backoff_factor: 2.0  # Exponential backoff multiplier
+    degrade_on_build_failure: false  # If true, a failed MCP build warns and skips MCP tools instead of raising
   logs_dir: "logs"  # Directory for saving agent execution logs
   reports_dir: "reports"  # Directory for saving agent reports
 
