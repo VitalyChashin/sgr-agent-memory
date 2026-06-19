@@ -1,0 +1,944 @@
+ CLAUDE.md                              |   2 +
+ config.yaml.example                    |   6 +
+ notes/mcp-retry.md                     |  52 ++++++
+ plans/mcp-connection-retry.md          | 286 +++++++++++++++++++++++++++++++++
+ sgr_agent_core/agent_definition.py     |  16 ++
+ sgr_agent_core/base_tool.py            |  30 +++-
+ sgr_agent_core/services/mcp_service.py | 147 ++++++++++-------
+ sgr_agent_core/services/retry.py       |  81 ++++++++++
+ tests/test_mcp_retry.py                | 202 +++++++++++++++++++++++
+ 9 files changed, 753 insertions(+), 69 deletions(-)
+
+diff --git a/CLAUDE.md b/CLAUDE.md
+index ff85e46..0cfc770 100644
+--- a/CLAUDE.md
++++ b/CLAUDE.md
+@@ -60,6 +60,8 @@ sgr_agent_core/           # Core Python package
+ 
+ MCP servers are configured in `config.yaml` under `mcp.mcpServers`. MCP tools use `MCPBaseTool` which handles calls through the MCP client and converts them to the framework's tool format. The framework uses `fastmcp` ≥ 2.12.4 for MCP server integration.
+ 
++**Connection retry.** Both MCP connect points retry transient transport errors (connection refused/reset, timeouts, broken sessions) per `execution.mcp_retry` (bounded exponential backoff; `services/retry.py`). Genuine tool errors (`ToolError`/`FastMCPError`) are **never** retried. **Build** (`build_tools_from_mcp`) re-raises after retries (fatal startup) unless `mcp_retry.degrade_on_build_failure: true`, which skips MCP tools instead. **Call** (`MCPBaseTool.__call__`) retries then, on final failure, swallows the error into the result string so the loop continues. The payload processor's `pre_call`/`post_call` run **once**, outside the retry loop. See `notes/mcp-retry.md`.
++
+ ## Processor Plugins
+ 
+ Three processor-plugin families share one skeleton (auto-registering ABC + `*Definition` + `*Chain` + registry-then-import-string resolution; see `notes/processor-plugin-pattern.md`):
+diff --git a/config.yaml.example b/config.yaml.example
+index 6cc993e..b8691af 100644
+--- a/config.yaml.example
++++ b/config.yaml.example
+@@ -15,6 +15,12 @@ execution:
+   max_clarifications: 3  # Max clarification requests
+   max_iterations: 10  # Max agent iterations
+   mcp_context_limit: 15000  # Max context length from MCP server response
++  mcp_retry:  # Retry policy for transient MCP connection/transport failures
++    attempts: 3  # Total connect tries (1 disables retry)
++    base_delay: 0.5  # First backoff delay (seconds)
++    max_delay: 8.0  # Backoff ceiling (seconds)
++    backoff_factor: 2.0  # Exponential backoff multiplier
++    degrade_on_build_failure: false  # If true, a failed MCP build warns and skips MCP tools instead of raising
+   logs_dir: "logs"  # Directory for saving agent execution logs
+   reports_dir: "reports"  # Directory for saving agent reports
+ 
+diff --git a/notes/mcp-retry.md b/notes/mcp-retry.md
+new file mode 100644
+index 0000000..6d89183
+--- /dev/null
++++ b/notes/mcp-retry.md
+@@ -0,0 +1,52 @@
++---
++title: MCP connection retry — settled design caveats
++status: current
++created: 2026-06-18
++updated: 2026-06-18
++related:
++  - plans/mcp-connection-retry.md
++  - sgr_agent_core/services/retry.py
++  - sgr_agent_core/base_tool.py
++  - sgr_agent_core/services/mcp_service.py
++---
++
++# Note: MCP connection retry (`services/retry.py`)
++
++**2026-06-18 —** Retry was added around both MCP connect points (build +
++call). A few deliberate choices that aren't obvious from the code:
++
++- **Only transport errors are retried, never `ToolError`.** The retryable
++  allow-list is `(ConnectionError, TimeoutError, OSError, McpError,
++  httpx.HTTPError)` plus `RuntimeError` *only* when its message matches a known
++  fastmcp session-init/teardown signature. fastmcp's `ToolError`/`FastMCPError`
++  family means the call reached the server and failed deterministically — retrying
++  wastes wall-clock and risks double side-effects, so it falls straight through on
++  the first attempt (and at call time is then swallowed into `"Error: {e}"`,
++  exactly as before retry existed).
++
++- **The `RuntimeError` message-match is the brittle part.** fastmcp wraps session
++  failures in bare `RuntimeError("Failed to initialize server session")` /
++  `"Server session was closed"`. We substring-match those rather than blanket-retry
++  every `RuntimeError`. If fastmcp rewords them on upgrade, those failures simply
++  stop being retried (degrades to pre-retry behavior, never worse). Re-check
++  `_RETRYABLE_RUNTIME_SIGNATURES` after fastmcp bumps.
++
++- **Payload processors run once, outside the retry loop.** In
++  `MCPBaseTool.__call__`, only `connect → call_tool` is wrapped; `run_pre_call`
++  (before) and `run_post_call` (after success) each run once. Pulling them into the
++  retried unit would re-mutate the payload per attempt.
++
++- **Build is fatal by default, call is not.** A failed build re-raises after
++  retries (fail-fast at startup beats silently launching an agent missing half its
++  tools). `mcp_retry.degrade_on_build_failure: true` flips it to "warn + return
++  non-MCP tools". A failed call always swallows after retries so the agent loop
++  keeps going — unchanged contract, retry just sits inside the existing try/except.
++
++- **Idempotency caveat for call retries.** We only retry transport-class errors,
++  which almost always mean the call never landed. The one theoretical hole: a
++  read-timeout *after* the server already acted could double-execute a
++  side-effecting tool. Accepted as low-risk for the transient set.
++
++- **Config lives in `ExecutionConfig.mcp_retry`, not `mcp:`.** The `mcp` field is
++  fastmcp's own `MCPConfig` model — we don't own it, so the knob sits in app-owned
++  `ExecutionConfig` next to `mcp_context_limit`.
+diff --git a/plans/mcp-connection-retry.md b/plans/mcp-connection-retry.md
+new file mode 100644
+index 0000000..4e2c40f
+--- /dev/null
++++ b/plans/mcp-connection-retry.md
+@@ -0,0 +1,286 @@
++---
++title: Implementation plan — MCP connection retry (build + call)
++status: archived
++created: 2026-06-18
++updated: 2026-06-18  # implemented: services/retry.py + ExecutionConfig.mcp_retry + both wrap sites + tests
++owner: Vitaly Chashin
++supersedes: []
++related:
++  - sgr_agent_core/services/retry.py
++  - sgr_agent_core/services/mcp_service.py
++  - sgr_agent_core/base_tool.py
++  - sgr_agent_core/agent_definition.py
++  - tests/test_mcp_retry.py
++  - notes/mcp-retry.md
++tags: [mcp, resilience, retry, plan]
++---
++
++> **Status: implemented (2026-06-18).** All steps landed as planned: hand-rolled
++> `services/retry.py` (no new dependency), `MCPRetryConfig` on
++> `ExecutionConfig.mcp_retry`, build- and call-time wrap sites, 20 tests in
++> `tests/test_mcp_retry.py` (incl. call-time integration), docs in `CLAUDE.md` /
++> `config.yaml.example` / `notes/mcp-retry.md`. Build default stayed fatal
++> (`degrade_on_build_failure: false`).
++
++# Plan: MCP connection retry
++
++Today there is **no retry** anywhere on the MCP path. Two failure surfaces:
++
++| Surface | Location | Current behavior |
++|---------|----------|------------------|
++| **Build** | `MCP2ToolConverter.build_tools_from_mcp` (`services/mcp_service.py:80-82`) — `Client(config)` + `async with client: list_tools()` | Unguarded. Connection failure propagates through `agent_factory.py:147` → **agent creation aborts (fatal)**. |
++| **Call** | `MCPBaseTool.__call__` (`base_tool.py:87-108`) — `async with self._client: call_tool(...)` | Wrapped in try/except → error **swallowed** into `"Error: {e}"` result string, loop continues. No retry. |
++
++Goal: add a small, dependency-free, bounded retry-with-backoff around both
++connect points, retrying **only transient connection/transport errors** and
++never genuine tool-logic errors.
++
++---
++
++## Key design decisions
++
++### 1. No new dependency — hand-rolled async retry helper
++`tenacity` is **not** installed and the project is deliberately lean. A ~25-line
++`async` retry helper covers exactly our needs (fixed count, exponential backoff,
++an explicit retryable-exception predicate). Tenacity is the alternative if we
++later want jitter/decorator ergonomics, but it's overkill here.
++
++### 2. Retry only transient errors — never `ToolError`
++fastmcp's exception taxonomy (verified in `.venv/.../fastmcp/exceptions.py`):
++
++- `FastMCPError` → `ToolError`, `ValidationError`, `ResourceError`, `PromptError`,
++  `AuthorizationError` — these mean *the call reached the server and failed on
++  logic/auth/args*. **Do not retry** (retrying a deterministically-failing tool
++  just wastes wall-clock and can double side-effects).
++- Transient transport/connection failures surface as: `mcp.McpError`,
++  `httpx.HTTPError` (ConnectError/ReadTimeout/etc.), builtin `ConnectionError`,
++  `TimeoutError`, `OSError`, and fastmcp's `RuntimeError("Failed to initialize
++  server session")` / `RuntimeError("Server session was closed unexpectedly")`.
++
++**Retryable set (explicit allow-list):**
++```python
++RETRYABLE_MCP_EXC = (ConnectionError, TimeoutError, OSError, McpError, httpx.HTTPError)
++```
++`RuntimeError` is the awkward case: fastmcp wraps init/session failures in bare
++`RuntimeError`. We retry `RuntimeError` **only** when its message matches a known
++transient signature (`"Failed to initialize server session"`,
++`"Server session was closed"`) — a small substring check in the predicate, so we
++don't blanket-retry every `RuntimeError`. `ToolError`/`FastMCPError` are never in
++the allow-list, so they fall straight through.
++
++### 3. Build-time stays fatal after retries exhausted (recommended)
++Fail-fast at startup is the right default: if the MCP server is down when the
++agent is built, silently starting an agent that's missing half its tools is more
++confusing than a clear startup error. So: **retry, then re-raise.** A
++`degrade_on_build_failure` flag (default `False`) is included as a documented
++escape hatch — when `True`, build logs a WARNING and returns the non-MCP tools
++only instead of raising. (Open question for review — see Gaps.)
++
++### 4. Config lives in `ExecutionConfig`
++`agent_definition.py:166` `mcp: MCPConfig` is **fastmcp's own** model — we don't
++own it and shouldn't add fields there. Retry knobs go in app-owned
++`ExecutionConfig` (`agent_definition.py:135`), right next to `mcp_context_limit`,
++under an `mcp_retry` sub-model so they're grouped.
++
++---
++
++## Implementation
++
++### Step 1 — Retry helper + config model
++New file `sgr_agent_core/services/retry.py`:
++
++```python
++import asyncio
++import logging
++from dataclasses import dataclass
++from typing import Awaitable, Callable, TypeVar
++
++import httpx
++from mcp.shared.exceptions import McpError
++
++logger = logging.getLogger(__name__)
++T = TypeVar("T")
++
++RETRYABLE_MCP_EXC: tuple[type[BaseException], ...] = (
++    ConnectionError, TimeoutError, OSError, McpError, httpx.HTTPError,
++)
++_RETRYABLE_RUNTIME_SIGNATURES = ("Failed to initialize server session",
++                                 "Server session was closed")
++
++
++def is_retryable_mcp_error(exc: BaseException) -> bool:
++    if isinstance(exc, RETRYABLE_MCP_EXC):
++        return True
++    if isinstance(exc, RuntimeError):
++        return any(sig in str(exc) for sig in _RETRYABLE_RUNTIME_SIGNATURES)
++    return False
++
++
++@dataclass
++class RetryPolicy:
++    attempts: int = 3          # total tries (1 = no retry)
++    base_delay: float = 0.5    # seconds, first backoff
++    max_delay: float = 8.0
++    backoff_factor: float = 2.0
++
++
++async def with_mcp_retry(
++    fn: Callable[[], Awaitable[T]], policy: RetryPolicy, *, what: str,
++) -> T:
++    delay = policy.base_delay
++    for attempt in range(1, policy.attempts + 1):
++        try:
++            return await fn()
++        except BaseException as exc:  # noqa: BLE001 — re-raised below unless retryable
++            if attempt >= policy.attempts or not is_retryable_mcp_error(exc):
++                raise
++            logger.warning(
++                "MCP %s failed (attempt %d/%d): %s — retrying in %.1fs",
++                what, attempt, policy.attempts, exc, delay,
++            )
++            await asyncio.sleep(delay)
++            delay = min(delay * policy.backoff_factor, policy.max_delay)
++    raise AssertionError("unreachable")  # loop either returns or raises
++```
++
++Add the config sub-model in `agent_definition.py` (above `ExecutionConfig`):
++```python
++class MCPRetryConfig(BaseModel):
++    attempts: int = Field(default=3, ge=1, description="Total MCP connect tries (1 disables retry)")
++    base_delay: float = Field(default=0.5, gt=0, description="First backoff delay (seconds)")
++    max_delay: float = Field(default=8.0, gt=0, description="Backoff ceiling (seconds)")
++    backoff_factor: float = Field(default=2.0, ge=1.0, description="Exponential backoff multiplier")
++    degrade_on_build_failure: bool = Field(
++        default=False,
++        description="If True, a failed MCP build logs a warning and returns non-MCP tools instead of raising",
++    )
++```
++And in `ExecutionConfig`:
++```python
++mcp_retry: MCPRetryConfig = Field(default_factory=MCPRetryConfig, description="MCP connection retry policy")
++```
++`extra="allow"` on `ExecutionConfig` means existing YAML without this key keeps
++working (defaults apply). Add a `RetryPolicy.from_config()` adapter or build the
++`RetryPolicy` inline from these fields.
++
++### Step 2 — Build-time retry (`services/mcp_service.py`)
++Wrap the connect+`list_tools()` block. Note the current code does work *inside*
++the `async with client:` (it iterates `mcp_tools` and stores `ToolCls._client = client`
++**while the context is open**). Retrying must re-open a fresh `Client` each
++attempt, so the retried unit is "open client → list_tools → snapshot the tool
++metadata", returning the tool list out of the `async with`.
++
++Minimal-diff approach: extract the existing body into an inner
++`async def _connect_and_build()` and call it via `with_mcp_retry`. Pull the
++`mcp_retry` policy from `GlobalConfig().execution.mcp_retry`.
++
++```python
++policy = RetryPolicy(**GlobalConfig().execution.mcp_retry.model_dump(exclude={"degrade_on_build_failure"}))
++try:
++    return await with_mcp_retry(_connect_and_build, policy, what=f"build_tools({server_names})")
++except Exception:
++    if GlobalConfig().execution.mcp_retry.degrade_on_build_failure:
++        logger.warning("MCP tool build failed after retries; continuing without MCP tools", exc_info=True)
++        return []
++    raise
++```
++
++> ⚠️ **Client lifetime caveat** (see `notes/`): `ToolCls._client` is the `Client`
++> built here. The tool layer re-enters `async with self._client` per call, so the
++> stored client just needs to be re-openable — which fastmcp's `Client` supports.
++> Retry must not leave a half-open client: `with_mcp_retry` only returns the tool
++> list (plain data), and each attempt's `async with` fully closes on exception, so
++> a failed attempt leaves nothing dangling. Verify no `ToolCls._client` escapes
++> pointing at a client whose context exited — it shouldn't, since assignment
++> happens inside the successful attempt's `async with`.
++
++### Step 3 — Call-time retry (`base_tool.py`)
++Wrap **only** the `async with self._client: call_tool(...)` connect+invoke in the
++retry, keeping the outer try/except that swallows the *final* failure into
++`"Error: {e}"` so loop semantics are unchanged.
++
++```python
++policy = RetryPolicy(**global_config.execution.mcp_retry.model_dump(exclude={"degrade_on_build_failure"}))
++
++async def _invoke():
++    async with self._client:
++        result = await self._client.call_tool(self.tool_name, payload)
++        return json.dumps([m.model_dump_json() for m in result.content], ensure_ascii=False)[
++            : global_config.execution.mcp_context_limit
++        ]
++
++try:
++    result_str = await with_mcp_retry(_invoke, policy, what=f"call_tool({self.tool_name})")
++    if self._processor_chain:
++        result_str = await self._processor_chain.run_post_call(...)
++    return result_str
++except Exception as e:
++    logger.error(...)  # unchanged: tag trace, mcp_call_errored.set(True), return f"Error: {e}"
++```
++Because `ToolError`/`FastMCPError` are not retryable, a tool that legitimately
++errors still fails on the **first** attempt and is swallowed exactly as today —
++only transport blips get the retry budget.
++
++> Note: `run_pre_call` runs **once** before the retry loop (payload mutation is
++> idempotent-by-design and shouldn't repeat per attempt). `run_post_call` runs
++> once after success. Keep them outside `_invoke`.
++
++### Step 4 — Tests (`tests/test_mcp_retry.py`)
++Unit-test the helper directly (no live MCP needed):
++- `is_retryable_mcp_error`: `McpError`/`ConnectionError`/`httpx.ConnectError`/
++  transient-`RuntimeError` → True; `ToolError`/`ValueError`/generic `RuntimeError`
++  → False.
++- `with_mcp_retry`: succeeds-on-2nd-attempt (fn raises `McpError` once then
++  returns); exhausts and re-raises after `attempts`; **does not retry** a
++  `ToolError` (fn called exactly once); respects `attempts=1` (no retry).
++- Backoff: monkeypatch `asyncio.sleep` to record delays, assert exponential
++  growth capped at `max_delay`.
++
++Integration (mock the `Client`):
++- Build: `Client` whose `list_tools` raises `McpError` N-1 times then succeeds →
++  tools built; raises every time → `build_tools_from_mcp` raises (default) /
++  returns `[]` (when `degrade_on_build_failure=True`).
++- Call: `call_tool` raises `ConnectionError` once then succeeds → real result
++  returned, not `"Error:"`; raises every time → `"Error: ..."` and
++  `mcp_call_errored` set.
++
++### Step 5 — Docs
++- `agents.yaml.example` / `config.yaml.example`: show an `execution.mcp_retry:`
++  block with the defaults and a one-line comment.
++- `CLAUDE.md` "MCP Integration" section: one sentence that MCP connects retry
++  transient transport errors per `execution.mcp_retry` (build re-raises by
++  default; calls swallow after retries).
++- `notes/mcp-retry.md`: record the two settled caveats — (a) `ToolError` is
++  deliberately non-retryable; (b) `run_pre_call` runs once, not per attempt.
++
++---
++
++## File-by-file change list
++
++| File | Change |
++|------|--------|
++| `sgr_agent_core/services/retry.py` | **new** — `RetryPolicy`, `is_retryable_mcp_error`, `with_mcp_retry` |
++| `sgr_agent_core/agent_definition.py` | **new** `MCPRetryConfig`; add `mcp_retry` field to `ExecutionConfig` |
++| `sgr_agent_core/services/mcp_service.py` | wrap connect+`list_tools` in retry; optional degrade path |
++| `sgr_agent_core/base_tool.py` | wrap `async with client: call_tool` in retry; keep outer swallow |
++| `tests/test_mcp_retry.py` | **new** — helper unit tests + mocked build/call integration |
++| `*.yaml.example`, `CLAUDE.md`, `notes/mcp-retry.md` | docs |
++
++## Estimated size
++~120 LOC source (helper + config + 2 wrap sites) + ~150 LOC tests. No new
++runtime dependency.
++
++## Risks / gaps
++- **`RuntimeError` message-matching is brittle** — fastmcp could reword its init
++  error strings on upgrade. Mitigation: keep the signature list small and
++  documented; worst case a transient init error simply isn't retried (degrades to
++  today's behavior, not worse). → file to `plans/gaps/` if we want a sturdier signal.
++- **Build fatal-vs-degrade default** — recommending fatal (re-raise). Confirm
++  this matches operational expectations before implementing; flip the default if
++  startup resilience is valued over fail-fast.
++- **Idempotency of `call_tool` retries** — retrying a tool with side effects could
++  double-execute *if* the failure happened server-side after the effect. We only
++  retry transport-class errors (connection refused/reset/timeout-on-connect),
++  which almost always mean the call didn't land — but a read-timeout *after* the
++  server acted is theoretically double-executable. Acceptable for the transient
++  set; documented in `notes/`.
+diff --git a/sgr_agent_core/agent_definition.py b/sgr_agent_core/agent_definition.py
+index a022e2a..654a4bf 100644
+--- a/sgr_agent_core/agent_definition.py
++++ b/sgr_agent_core/agent_definition.py
+@@ -132,6 +132,19 @@ class PromptsConfig(BaseModel, extra="allow"):
+         )
+ 
+ 
++class MCPRetryConfig(BaseModel):
++    """Retry policy for transient MCP connection/transport failures."""
++
++    attempts: int = Field(default=3, ge=1, description="Total MCP connect tries (1 disables retry)")
++    base_delay: float = Field(default=0.5, gt=0, description="First backoff delay in seconds")
++    max_delay: float = Field(default=8.0, gt=0, description="Backoff ceiling in seconds")
++    backoff_factor: float = Field(default=2.0, ge=1.0, description="Exponential backoff multiplier")
++    degrade_on_build_failure: bool = Field(
++        default=False,
++        description="If True, a failed MCP tool build logs a warning and returns non-MCP tools instead of raising",
++    )
++
++
+ class ExecutionConfig(BaseModel, extra="allow"):
+     """Execution parameters and limits for agents.
+ 
+@@ -141,6 +154,9 @@ class ExecutionConfig(BaseModel, extra="allow"):
+     max_clarifications: int = Field(default=3, ge=0, description="Maximum number of clarifications")
+     max_iterations: int = Field(default=10, gt=0, description="Maximum number of iterations")
+     mcp_context_limit: int = Field(default=15000, gt=0, description="Maximum context length from MCP server response")
++    mcp_retry: MCPRetryConfig = Field(
++        default_factory=MCPRetryConfig, description="Retry policy for transient MCP connection failures"
++    )
+ 
+     streaming_generator: Literal["openai", "open_webui"] = Field(
+         default="openai",
+diff --git a/sgr_agent_core/base_tool.py b/sgr_agent_core/base_tool.py
+index 578ad3c..3c701c1 100644
+--- a/sgr_agent_core/base_tool.py
++++ b/sgr_agent_core/base_tool.py
+@@ -10,6 +10,7 @@ from pydantic import BaseModel
+ from sgr_agent_core.agent_config import GlobalConfig
+ from sgr_agent_core.observability.context import mcp_call_errored
+ from sgr_agent_core.services.registry import ToolRegistry
++from sgr_agent_core.services.retry import RetryPolicy, with_mcp_retry
+ 
+ if TYPE_CHECKING:
+     from sgr_agent_core.agent_definition import AgentConfig
+@@ -84,20 +85,33 @@ class MCPBaseTool(BaseTool):
+                 payload, context, config, provider=provider, parent_span=parent_span, **kwargs
+             )
+ 
+-        try:
++        async def _invoke() -> str:
+             async with self._client:
+                 result = await self._client.call_tool(self.tool_name, payload)
+-                result_str = json.dumps([m.model_dump_json() for m in result.content], ensure_ascii=False)[
++                return json.dumps([m.model_dump_json() for m in result.content], ensure_ascii=False)[
+                     : global_config.execution.mcp_context_limit
+                 ]
+ 
+-                # Apply processor chain after MCP call
+-                if self._processor_chain:
+-                    result_str = await self._processor_chain.run_post_call(
+-                        result_str, payload, context, config, provider=provider, parent_span=parent_span, **kwargs
+-                    )
++        retry_cfg = global_config.execution.mcp_retry
++        policy = RetryPolicy(
++            attempts=retry_cfg.attempts,
++            base_delay=retry_cfg.base_delay,
++            max_delay=retry_cfg.max_delay,
++            backoff_factor=retry_cfg.backoff_factor,
++        )
++
++        try:
++            # Retry wraps only the connect+call (transient transport errors); the
++            # processor chain runs once on the final successful result.
++            result_str = await with_mcp_retry(_invoke, policy, what=f"call_tool({self.tool_name})")
++
++            # Apply processor chain after MCP call
++            if self._processor_chain:
++                result_str = await self._processor_chain.run_post_call(
++                    result_str, payload, context, config, provider=provider, parent_span=parent_span, **kwargs
++                )
+ 
+-                return result_str
++            return result_str
+         except Exception as e:
+             logger.error(f"Error processing MCP tool {self.tool_name}: {e}")
+             # The error is swallowed into the result string so the loop continues, but
+diff --git a/sgr_agent_core/services/mcp_service.py b/sgr_agent_core/services/mcp_service.py
+index d00fa78..0667eef 100644
+--- a/sgr_agent_core/services/mcp_service.py
++++ b/sgr_agent_core/services/mcp_service.py
+@@ -7,6 +7,8 @@ from fastmcp.mcp_config import MCPConfig
+ from jambo import SchemaConverter
+ from pydantic import create_model
+ 
++from sgr_agent_core.services.retry import RetryPolicy, with_mcp_retry
++
+ logger = logging.getLogger(__name__)
+ 
+ 
+@@ -63,6 +65,7 @@ class MCP2ToolConverter:
+     @classmethod
+     async def build_tools_from_mcp(cls, config: MCPConfig):
+         from sgr_agent_core import BaseTool, MCPBaseTool
++        from sgr_agent_core.agent_config import GlobalConfig
+ 
+         tools = []
+         if not config.mcpServers:
+@@ -77,65 +80,87 @@ class MCP2ToolConverter:
+                 elif isinstance(server_cfg, dict):
+                     server_processor_configs[server_name] = server_cfg.get("payload_processors", [])
+ 
+-        client: Client = Client(config)
+-        async with client:
+-            mcp_tools = await client.list_tools()
+-
+-            # Merge processor defs from all servers, deduplicating by class name
+-            seen_classes: set[str] = set()
+-            unique_processor_defs: list[dict] = []
+-            for defs in server_processor_configs.values():
+-                for d in defs:
+-                    cls_name = d.get("class", "")
+-                    if cls_name not in seen_classes:
+-                        seen_classes.add(cls_name)
+-                        unique_processor_defs.append(d)
+-
+-            processor_chain, managed_fields = cls._build_processor_chain(unique_processor_defs)
+-
+-            for t in mcp_tools:
+-                if not t.name or not t.inputSchema:
+-                    logger.error(f"Skipping tool due to missing name or input schema: {t}")
+-                    continue
+-
+-                try:
+-                    t.inputSchema["title"] = cls._to_CamelCase(t.name)
+-                    PdModel = SchemaConverter.build(t.inputSchema)
+-                except Exception as e:
+-                    logger.error(f"Error creating model {t.name} from schema: {t.inputSchema}: {e}")
+-                    continue
+-
+-                ToolCls: Type[BaseTool] = create_model(
+-                    f"MCP{cls._to_CamelCase(t.name)}", __base__=(PdModel, MCPBaseTool), __doc__=t.description or ""
++        async def _connect_and_build() -> list:
++            built: list = []
++            client: Client = Client(config)
++            async with client:
++                mcp_tools = await client.list_tools()
++
++                # Merge processor defs from all servers, deduplicating by class name
++                seen_classes: set[str] = set()
++                unique_processor_defs: list[dict] = []
++                for defs in server_processor_configs.values():
++                    for d in defs:
++                        cls_name = d.get("class", "")
++                        if cls_name not in seen_classes:
++                            seen_classes.add(cls_name)
++                            unique_processor_defs.append(d)
++
++                processor_chain, managed_fields = cls._build_processor_chain(unique_processor_defs)
++
++                for t in mcp_tools:
++                    if not t.name or not t.inputSchema:
++                        logger.error(f"Skipping tool due to missing name or input schema: {t}")
++                        continue
++
++                    try:
++                        t.inputSchema["title"] = cls._to_CamelCase(t.name)
++                        PdModel = SchemaConverter.build(t.inputSchema)
++                    except Exception as e:
++                        logger.error(f"Error creating model {t.name} from schema: {t.inputSchema}: {e}")
++                        continue
++
++                    ToolCls: Type[BaseTool] = create_model(
++                        f"MCP{cls._to_CamelCase(t.name)}", __base__=(PdModel, MCPBaseTool), __doc__=t.description or ""
++                    )
++                    ToolCls.tool_name = t.name
++                    ToolCls.description = t.description or ""
++                    ToolCls._client = client
++                    ToolCls._processor_chain = processor_chain
++                    ToolCls._managed_fields = managed_fields
++
++                    # Override model_json_schema to hide managed fields from LLM
++                    if managed_fields:
++                        import copy
++
++                        _fields_to_hide = list(managed_fields)
++                        original_schema = ToolCls.model_json_schema
++
++                        @classmethod  # type: ignore[misc]
++                        def _filtered_schema(cls, *args: Any, **kwargs: Any) -> dict:
++                            schema = copy.deepcopy(original_schema(*args, **kwargs))
++                            props = schema.get("properties", {})
++                            required = schema.get("required", [])
++                            for field_name in _fields_to_hide:
++                                props.pop(field_name, None)
++                                if field_name in required:
++                                    required.remove(field_name)
++                            return schema
++
++                        ToolCls.model_json_schema = _filtered_schema  # type: ignore[assignment]
++
++                    built.append(ToolCls)
++                    logger.info(f"Built MCP Tool: {ToolCls.tool_name}")
++
++                logger.info(f"Built {len(built)} MCP tools.")
++                return built
++
++        retry_cfg = GlobalConfig().execution.mcp_retry
++        policy = RetryPolicy(
++            attempts=retry_cfg.attempts,
++            base_delay=retry_cfg.base_delay,
++            max_delay=retry_cfg.max_delay,
++            backoff_factor=retry_cfg.backoff_factor,
++        )
++        server_names = ",".join(config.mcpServers.keys())
++        try:
++            return await with_mcp_retry(_connect_and_build, policy, what=f"build_tools({server_names})")
++        except Exception:
++            if retry_cfg.degrade_on_build_failure:
++                logger.warning(
++                    "MCP tool build failed after %d attempt(s); continuing without MCP tools",
++                    policy.attempts,
++                    exc_info=True,
+                 )
+-                ToolCls.tool_name = t.name
+-                ToolCls.description = t.description or ""
+-                ToolCls._client = client
+-                ToolCls._processor_chain = processor_chain
+-                ToolCls._managed_fields = managed_fields
+-
+-                # Override model_json_schema to hide managed fields from LLM
+-                if managed_fields:
+-                    import copy
+-
+-                    _fields_to_hide = list(managed_fields)
+-                    original_schema = ToolCls.model_json_schema
+-
+-                    @classmethod  # type: ignore[misc]
+-                    def _filtered_schema(cls, *args: Any, **kwargs: Any) -> dict:
+-                        schema = copy.deepcopy(original_schema(*args, **kwargs))
+-                        props = schema.get("properties", {})
+-                        required = schema.get("required", [])
+-                        for field_name in _fields_to_hide:
+-                            props.pop(field_name, None)
+-                            if field_name in required:
+-                                required.remove(field_name)
+-                        return schema
+-
+-                    ToolCls.model_json_schema = _filtered_schema  # type: ignore[assignment]
+-
+-                tools.append(ToolCls)
+-                logger.info(f"Built MCP Tool: {ToolCls.tool_name}")
+-
+-            logger.info(f"Built {len(tools)} MCP tools.")
+-            return tools
++                return tools
++            raise
+diff --git a/sgr_agent_core/services/retry.py b/sgr_agent_core/services/retry.py
+new file mode 100644
+index 0000000..d1b4735
+--- /dev/null
++++ b/sgr_agent_core/services/retry.py
+@@ -0,0 +1,81 @@
++"""Bounded retry-with-backoff for transient MCP connection/transport failures.
++
++Only *transport* errors are retried (connection refused/reset, timeouts, broken
++sessions). Genuine tool-logic errors — fastmcp's ``ToolError``/``FastMCPError``
++family — are never retried: they reached the server and failed deterministically,
++so retrying just wastes time and risks double side-effects.
++"""
++
++import asyncio
++import logging
++from dataclasses import dataclass
++from typing import Awaitable, Callable, TypeVar
++
++import httpx
++from mcp import McpError
++
++logger = logging.getLogger(__name__)
++
++T = TypeVar("T")
++
++# Transport/connection exceptions worth retrying. Notably absent: fastmcp's
++# ToolError/FastMCPError (logic failures) and plain ValueError/TypeError.
++RETRYABLE_MCP_EXC: tuple[type[BaseException], ...] = (
++    ConnectionError,
++    TimeoutError,
++    OSError,
++    McpError,
++    httpx.HTTPError,
++)
++
++# fastmcp wraps session init/teardown failures in bare RuntimeError; retry only
++# these known-transient messages rather than blanket-retrying every RuntimeError.
++_RETRYABLE_RUNTIME_SIGNATURES = (
++    "Failed to initialize server session",
++    "Server session was closed",
++)
++
++
++def is_retryable_mcp_error(exc: BaseException) -> bool:
++    """True for transient transport errors that a reconnect might fix."""
++    if isinstance(exc, RETRYABLE_MCP_EXC):
++        return True
++    if isinstance(exc, RuntimeError):
++        return any(sig in str(exc) for sig in _RETRYABLE_RUNTIME_SIGNATURES)
++    return False
++
++
++@dataclass
++class RetryPolicy:
++    """Bounded exponential-backoff policy. ``attempts=1`` disables retry."""
++
++    attempts: int = 3
++    base_delay: float = 0.5
++    max_delay: float = 8.0
++    backoff_factor: float = 2.0
++
++
++async def with_mcp_retry(fn: Callable[[], Awaitable[T]], policy: RetryPolicy, *, what: str) -> T:
++    """Run ``fn`` with retry on transient MCP errors.
++
++    Non-retryable exceptions (e.g. ``ToolError``) and the final attempt's failure
++    propagate unchanged. ``what`` is a short label used in retry log lines.
++    """
++    delay = policy.base_delay
++    for attempt in range(1, policy.attempts + 1):
++        try:
++            return await fn()
++        except BaseException as exc:  # noqa: BLE001 — re-raised below unless retryable
++            if attempt >= policy.attempts or not is_retryable_mcp_error(exc):
++                raise
++            logger.warning(
++                "MCP %s failed (attempt %d/%d): %s — retrying in %.1fs",
++                what,
++                attempt,
++                policy.attempts,
++                exc,
++                delay,
++            )
++            await asyncio.sleep(delay)
++            delay = min(delay * policy.backoff_factor, policy.max_delay)
++    raise AssertionError("unreachable")  # loop either returns or raises
+diff --git a/tests/test_mcp_retry.py b/tests/test_mcp_retry.py
+new file mode 100644
+index 0000000..14b2190
+--- /dev/null
++++ b/tests/test_mcp_retry.py
+@@ -0,0 +1,202 @@
++"""Tests for MCP connection retry (sgr_agent_core.services.retry)."""
++
++import httpx
++import pytest
++from fastmcp.exceptions import ToolError
++from mcp import McpError
++from mcp.types import ErrorData
++
++from sgr_agent_core.services.retry import (
++    RetryPolicy,
++    is_retryable_mcp_error,
++    with_mcp_retry,
++)
++
++
++def _mcp_error(msg: str = "connection lost") -> McpError:
++    return McpError(ErrorData(code=-32000, message=msg))
++
++
++class TestIsRetryable:
++    @pytest.mark.parametrize(
++        "exc",
++        [
++            ConnectionError("refused"),
++            TimeoutError("timed out"),
++            OSError("broken pipe"),
++            httpx.ConnectError("no route"),
++            httpx.ReadTimeout("slow"),
++            _mcp_error(),
++            RuntimeError("Failed to initialize server session"),
++            RuntimeError("Server session was closed unexpectedly"),
++        ],
++    )
++    def test_transient_errors_are_retryable(self, exc):
++        assert is_retryable_mcp_error(exc) is True
++
++    @pytest.mark.parametrize(
++        "exc",
++        [
++            ToolError("tool blew up"),
++            ValueError("bad args"),
++            TypeError("wrong type"),
++            RuntimeError("some unrelated runtime error"),
++            KeyError("missing"),
++        ],
++    )
++    def test_logic_errors_are_not_retryable(self, exc):
++        assert is_retryable_mcp_error(exc) is False
++
++
++class TestWithMcpRetry:
++    pytestmark = pytest.mark.asyncio
++
++    async def test_succeeds_on_second_attempt(self):
++        calls = {"n": 0}
++
++        async def fn():
++            calls["n"] += 1
++            if calls["n"] == 1:
++                raise _mcp_error()
++            return "ok"
++
++        result = await with_mcp_retry(fn, RetryPolicy(attempts=3, base_delay=0), what="test")
++        assert result == "ok"
++        assert calls["n"] == 2
++
++    async def test_exhausts_and_reraises(self):
++        calls = {"n": 0}
++
++        async def fn():
++            calls["n"] += 1
++            raise ConnectionError("still down")
++
++        with pytest.raises(ConnectionError):
++            await with_mcp_retry(fn, RetryPolicy(attempts=3, base_delay=0), what="test")
++        assert calls["n"] == 3
++
++    async def test_does_not_retry_tool_error(self):
++        calls = {"n": 0}
++
++        async def fn():
++            calls["n"] += 1
++            raise ToolError("deterministic failure")
++
++        with pytest.raises(ToolError):
++            await with_mcp_retry(fn, RetryPolicy(attempts=5, base_delay=0), what="test")
++        assert calls["n"] == 1  # failed once, never retried
++
++    async def test_attempts_one_disables_retry(self):
++        calls = {"n": 0}
++
++        async def fn():
++            calls["n"] += 1
++            raise _mcp_error()
++
++        with pytest.raises(McpError):
++            await with_mcp_retry(fn, RetryPolicy(attempts=1, base_delay=0), what="test")
++        assert calls["n"] == 1
++
++    async def test_backoff_is_exponential_and_capped(self, monkeypatch):
++        delays: list[float] = []
++
++        async def fake_sleep(d):
++            delays.append(d)
++
++        monkeypatch.setattr("sgr_agent_core.services.retry.asyncio.sleep", fake_sleep)
++
++        async def fn():
++            raise ConnectionError("down")
++
++        policy = RetryPolicy(attempts=5, base_delay=1.0, max_delay=4.0, backoff_factor=2.0)
++        with pytest.raises(ConnectionError):
++            await with_mcp_retry(fn, policy, what="test")
++
++        # 5 attempts → 4 sleeps; 1, 2, 4, then capped at 4
++        assert delays == [1.0, 2.0, 4.0, 4.0]
++
++
++class _FakeContent:
++    def model_dump_json(self) -> str:
++        return '{"ok": true}'
++
++
++class _FakeResult:
++    content = [_FakeContent()]
++
++
++class _FakeClient:
++    """Async-context-manager stand-in for fastmcp.Client.
++
++    ``fail_times`` transient ConnectionErrors on call_tool, then success.
++    """
++
++    def __init__(self, fail_times: int):
++        self.fail_times = fail_times
++        self.calls = 0
++
++    async def __aenter__(self):
++        return self
++
++    async def __aexit__(self, *exc):
++        return False
++
++    async def call_tool(self, name, payload):
++        self.calls += 1
++        if self.calls <= self.fail_times:
++            raise ConnectionError("transient")
++        return _FakeResult()
++
++
++class TestMCPBaseToolCallRetry:
++    """Call-time wiring: MCPBaseTool.__call__ retries transient errors, swallows final."""
++
++    pytestmark = pytest.mark.asyncio
++
++    def _make_tool(self, client, monkeypatch):
++        from pydantic import create_model
++
++        from sgr_agent_core import MCPBaseTool
++        from sgr_agent_core.agent_config import GlobalConfig
++
++        # Fast retries: 3 attempts, no real sleeping.
++        GlobalConfig().execution.mcp_retry.attempts = 3
++        GlobalConfig().execution.mcp_retry.base_delay = 0
++
++        ToolCls = create_model("MCPFakeTool", __base__=MCPBaseTool)
++        ToolCls.tool_name = "fake_tool"
++        ToolCls._client = client
++        ToolCls._processor_chain = None
++        return ToolCls()
++
++    async def test_retries_then_succeeds(self, monkeypatch):
++        from sgr_agent_core.models import AgentContext
++        from sgr_agent_core.observability.context import mcp_call_errored
++
++        mcp_call_errored.set(False)
++        client = _FakeClient(fail_times=1)
++        tool = self._make_tool(client, monkeypatch)
++        ctx = AgentContext()
++
++        result = await tool(ctx, None)
++
++        assert "ok" in result
++        assert not result.startswith("Error:")
++        assert client.calls == 2
++        assert "error:mcp_tool" not in ctx.error_tags
++
++    async def test_swallows_after_exhaustion(self, monkeypatch):
++        from sgr_agent_core.models import AgentContext
++        from sgr_agent_core.observability.context import mcp_call_errored
++
++        mcp_call_errored.set(False)
++        client = _FakeClient(fail_times=99)  # never recovers
++        tool = self._make_tool(client, monkeypatch)
++        ctx = AgentContext()
++
++        result = await tool(ctx, None)
++
++        assert result.startswith("Error:")
++        assert client.calls == 3  # exhausted all attempts
++        assert "error:mcp_tool" in ctx.error_tags
++        assert mcp_call_errored.get() is True

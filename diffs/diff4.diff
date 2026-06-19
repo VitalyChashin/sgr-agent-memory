@@ -1,0 +1,750 @@
+ CLAUDE.md                                       |  33 ++++
+ notes/langfuse-tool-definitions.md              |  53 ++++++
+ plans/langfuse-tool-definitions-in-traces.md    | 225 ++++++++++++++++++++++++
+ scripts/langfuse_tool_trace_demo.py             | 121 +++++++++++++
+ sgr_agent_core/agents/sgr_tool_calling_agent.py |  10 +-
+ sgr_agent_core/agents/tool_calling_agent.py     |   5 +-
+ sgr_agent_core/base_agent.py                    |  47 +++++
+ sgr_agent_core/observability/config.py          |   6 +
+ tests/test_tool_definitions_in_traces.py        | 119 +++++++++++++
+ 9 files changed, 613 insertions(+), 6 deletions(-)
+
+diff --git a/CLAUDE.md b/CLAUDE.md
+index 0cfc770..8e70a32 100644
+--- a/CLAUDE.md
++++ b/CLAUDE.md
+@@ -74,6 +74,39 @@ Three processor-plugin families share one skeleton (auto-registering ABC + `*Def
+ 
+ **Agent Context Processors** are configured **per-agent** via the `context_processors` list on `AgentConfig` (per-agent value replaces the global default). They run at three seams: `on_prepare_tools` (drop tools before selection), `on_tool_end`, and `on_before_finish` (veto a premature finish + inject messages). Hooks are fail-safe-but-visible (logged at WARNING; failures never loop the agent forever). Each hook is offered the active observability `provider`/`parent_span` for **optional** per-processor span emission (`emit_event_span`, a no-op under `NoOpProvider`). Built-ins: `RepeatedToolCallGuard`, `MandatoryToolCallProcessor`. Config example: `agents.yaml.example`.
+ 
++## Local Langfuse (observability testing)
++
++A local Langfuse instance is available for manually inspecting traces at
++`http://localhost:3000`. Install the optional SDK with `uv pip install
++"langfuse>=2.0.0,<3.0.0"` (the `observability` extra). Local-only dev keys:
++
++```python
++from langfuse import Langfuse
++
++langfuse = Langfuse(
++    secret_key="sk-lf-fa49d4be-6763-400d-9542-76736c056e65",
++    public_key="pk-lf-519ae97e-7f15-42fa-ab0f-42e7be77fd64",
++    host="http://localhost:3000",
++)
++```
++
++Equivalent framework config (enables the `LangfuseProvider` for an agent run):
++
++```yaml
++observability:
++  enabled: true
++  provider: langfuse
++  capture_tool_definitions: true   # embed tool defs in generation input (Available-tools section)
++  langfuse:
++    public_key: "pk-lf-519ae97e-7f15-42fa-ab0f-42e7be77fd64"
++    secret_key: "sk-lf-fa49d4be-6763-400d-9542-76736c056e65"
++    base_url: "http://localhost:3000"
++```
++
++Demo runner that emits a real `ToolCallingAgent` trace: `scripts/langfuse_tool_trace_demo.py`
++(needs `OPENAI_API_KEY`). These are throwaway local-instance keys — fine to keep
++in-repo, do **not** reuse the pattern for any hosted Langfuse.
++
+ ## Development Commands
+ 
+ ```bash
+diff --git a/notes/langfuse-tool-definitions.md b/notes/langfuse-tool-definitions.md
+new file mode 100644
+index 0000000..78885cb
+--- /dev/null
++++ b/notes/langfuse-tool-definitions.md
+@@ -0,0 +1,53 @@
++---
++title: Tool definitions in Langfuse traces — settled design caveats
++status: current
++created: 2026-06-19
++updated: 2026-06-19
++related:
++  - plans/langfuse-tool-definitions-in-traces.md
++  - sgr_agent_core/base_agent.py
++  - sgr_agent_core/agents/tool_calling_agent.py
++  - sgr_agent_core/agents/sgr_tool_calling_agent.py
++  - sgr_agent_core/observability/config.py
++---
++
++# Note: tool definitions in Langfuse traces (`_build_gen_input`)
++
++**2026-06-19 —** The FC agents now embed the tool defs offered to the LLM in the
++generation `input` so Langfuse renders its native **Available-tools** section.
++Settled decisions worth remembering:
++
++- **Input is a request-shaped object, not a bare list.** `_build_gen_input`
++  returns `{"messages": [...], "tools": [...], "tool_choice": ...}`. Langfuse
++  renders `messages` as the chat *and* detects `tools` as a separate collapsible
++  section with output calls auto-numbered to match. Putting tools in `metadata`
++  was rejected — it renders as raw JSON with no tool-aware view and no link to
++  the calls made.
++
++- **Do NOT flatten the tool shape.** Tools must stay in the full
++  `{"type": "function", "function": {name, description, parameters}}` form
++  (exactly what `pydantic_function_tool` emits) — that's what Langfuse's renderer
++  keys on. Flattening to `{name, description}` kills the native section. The one
++  place we *do* flatten is the large-toolset degrade path (see below), which
++  knowingly trades the rich rendering for trace size.
++
++- **Native section needs the Nov-2025 "Langfuse for Agents" release.** Cloud has
++  it; self-hosted must be recent enough. On older instances nothing breaks —
++  messages still render as chat, tools just show as plain JSON in the input.
++
++- **Size guard, not silent truncation.** Above `BaseAgent._MAX_TRACED_TOOL_DEFS`
++  (40) the tools degrade to compact `[{name, description}]` and the payload is
++  flagged `_tools_truncated: true` so the capping is visible in the trace
++  (project convention: never silently cap coverage).
++
++- **Toggle:** `observability.capture_tool_definitions` (default `True`). When
++  off, `input` reverts to the bare messages list (old behaviour). Gating lives
++  in `_build_gen_input` so the agents stay dumb — they always pass `tool_defs`.
++
++- **MCP tools need no special handling.** Their descriptions already flow
++  correctly into the function defs at build time, so they appear in the input
++  section automatically.
++
++- **Scope:** the three FC seams (`ToolCallingAgent` action; `SGRToolCallingAgent`
++  reasoning + action). `SGRAgent` (pure structured output, no `tools=`) is out of
++  scope — it passes a response schema, not a tool list.
+diff --git a/plans/langfuse-tool-definitions-in-traces.md b/plans/langfuse-tool-definitions-in-traces.md
+new file mode 100644
+index 0000000..aaa100f
+--- /dev/null
++++ b/plans/langfuse-tool-definitions-in-traces.md
+@@ -0,0 +1,225 @@
++---
++title: Implementation plan — Capture tool definitions in Langfuse generation traces
++status: archived
++created: 2026-06-19
++updated: 2026-06-19  # implemented: _build_gen_input + capture_tool_definitions flag + tests
++owner: Vitaly Chashin
++supersedes: []
++related:
++  - sgr_agent_core/base_agent.py
++  - sgr_agent_core/agents/tool_calling_agent.py
++  - sgr_agent_core/agents/sgr_tool_calling_agent.py
++  - sgr_agent_core/observability/config.py
++  - sgr_agent_core/observability/langfuse_provider.py
++tags: [observability, langfuse, tools, plan]
++---
++
++# Plan: Capture tool definitions in Langfuse generation traces
++
++## Problem
++
++The function-calling agents pass `tools=await self._prepare_tools()` to the
++OpenAI API (`tool_calling_agent.py:46`, `sgr_tool_calling_agent.py:49,97`), but
++the `_last_llm_call` dict they hand to observability records only
++`messages` (`input`), `model_parameters` (`temperature`/`max_tokens`), `usage`,
++and `output`. The `tools=` array — names, **descriptions**, and JSON parameter
++schemas — is never forwarded to `provider.start_generation`
++(`base_agent.py:300-308, 326-334`), so it is invisible in Langfuse.
++
++Result: a trace shows *that* a tool was called but not *which tools were
++available* to the LLM at decision time, nor their descriptions/schemas. (MCP
++tool descriptions themselves are built and passed correctly — verified — so this
++is purely a tracing gap, not a build bug.)
++
++## Goal
++
++Surface the tool definitions offered to the LLM in each FC generation, rendered
++in Langfuse's **native available-tools section** at the top of the generation's
++chat view — a distinct, collapsible section above the messages, with output tool
++calls auto-linked to it. Cover all three FC seams:
++
++- `SGRToolCallingAgent._reasoning_phase` — the single `ReasoningTool` def.
++- `SGRToolCallingAgent._select_action_phase` — the full action toolset.
++- `ToolCallingAgent._select_action_phase` — the full action toolset.
++
++Out of scope: `SGRAgent` (pure structured output; passes a response schema, not
++`tools=`) and `ToolCallingAgent` reasoning (it has none). Noted as a follow-up.
++
++## Why the `input` object (revised after Langfuse research)
++
++Langfuse's **"Langfuse for Agents"** release (2025-11-05) renders tool/function
++definitions natively **when they live in the generation `input`** in the
++OpenAI-request shape `{"messages": [...], "tools": [...], "tool_choice": ...}`.
++Langfuse renders `messages` as chat bubbles *and* detects `tools` as a separate
++**Available tools** section at the top of the chat view — click a tool to expand
++its description/parameters; output tool calls are numbered to match. This is the
++same structure Langfuse's own OpenAI auto-instrumentation captures.
++
++| Target | Renders as | Fit |
++|--------|-----------|-----|
++| `input` object `{messages, tools, tool_choice}` | chat bubbles **+ dedicated Available-tools section** | ✓ purpose-built; collapsible; linked to output calls |
++| `metadata` | generic Metadata panel (raw JSON) | ~ works, but no tool-aware rendering, not linked to calls — **fallback only** |
++| `model_parameters` | flat key/value; stringifies nested values | ✗ nested schemas render poorly |
++
++**Decision:** put tools in `input` as the request-shaped object. `pydantic_function_tool(...)`
++already emits the exact `{"type":"function","function":{name,description,parameters}}`
++shape Langfuse expects, so no transformation is needed.
++
++> **Version caveat.** The dedicated section needs a Langfuse build with the
++> Nov-2025 agent tool rendering (Langfuse Cloud has it; self-hosted must be
++> recent enough). On older versions nothing breaks — `messages` still render as
++> chat and `tools` render as plain JSON in the input, just without the
++> collapsible section. The metadata approach (below) remains available as a
++> fallback if the target instance is too old.
++
++---
++
++## Step 1 — Hoist `_prepare_tools()` so the same list feeds API + trace
++
++Today `_prepare_tools()` is called inline inside the `stream(...)` call and the
++result is discarded. Capture it in a local so we can both send it and trace it.
++
++**`tool_calling_agent.py:41-64`** (`_select_action_phase`):
++
++```python
++messages = await self._prepare_context()
++tool_defs = await self._prepare_tools()          # NEW: hoisted
++async with self.openai_client.chat.completions.stream(
++    messages=messages,
++    tools=tool_defs,                              # was: await self._prepare_tools()
++    tool_choice=self.tool_choice,
++    **self.config.llm.to_openai_client_kwargs(),
++) as stream:
++    ...
++self._last_llm_call = {
++    "name": "action-selection",
++    "model": self.config.llm.model,
++    "model_parameters": {"temperature": ..., "max_tokens": ...},
++    "usage": ...,
++    "input": self._build_gen_input(messages, tool_defs),   # CHANGED: see Step 2
++    "output": ...,
++}
++```
++
++**`sgr_tool_calling_agent.py`** — identical hoist in two places:
++
++- `_reasoning_phase` (lines 47-68): hoist
++  `tool_defs = [pydantic_function_tool(self.ReasoningTool, name=self.ReasoningTool.tool_name)]`,
++  pass it as `tools=tool_defs`, and set `"input": self._build_gen_input(messages, tool_defs)`.
++- `_select_action_phase` (lines 95-115): same pattern as `ToolCallingAgent`.
++
++`ChatCompletionFunctionToolParam` is a plain TypedDict (JSON-serializable), so
++the list can be embedded as-is.
++
++## Step 2 — Build the request-shaped `input` (`_build_gen_input`)
++
++Replace the bare-list `input` with the OpenAI-request object so Langfuse renders
++the **Available tools** section. One helper in `base_agent.py` keeps the shape
++consistent across all three seams and centralizes the toggle + size guard.
++
++**`base_agent.py`** — new helper (near `_prepare_tools`):
++
++```python
++def _build_gen_input(self, messages: list, tool_defs: list[dict], tool_choice=None) -> Any:
++    """Shape the generation input so Langfuse renders an Available-tools section.
++
++    Returns the OpenAI-request object {messages, tools, tool_choice} when tool
++    capture is on and tools exist; otherwise the bare messages list (unchanged
++    behaviour, e.g. NoOp/structured-output paths).
++    """
++    if not tool_defs or not GlobalConfig().observability.capture_tool_definitions:
++        return messages
++    payload = {"messages": messages, "tools": tool_defs}
++    tc = tool_choice if tool_choice is not None else getattr(self, "tool_choice", None)
++    if tc is not None:
++        payload["tool_choice"] = tc
++    return payload
++```
++
++Notes:
++- Keep `tools` in the **full** `{"type":"function","function":{...}}` shape —
++  that exact structure is what Langfuse's tool renderer keys on, so do **not**
++  flatten to `{name, description}` here (that's what kills the native section).
++- `messages` stays under the `messages` key → Langfuse still renders the chat.
++- **No change** to `base_agent._execution_step` metadata, `start_generation`, or
++  the provider — they forward `input` through untouched
++  (`base_agent.py:300-308, 326-334`; `langfuse_provider.py:214-228`). NoOp
++  ignores it.
++
++## Step 3 — Size guard
++
++The native renderer wants full schemas, so we keep them — but guard against a
++pathologically large toolset blowing up trace size. Apply inside
++`_build_gen_input` before embedding:
++
++- If `len(tool_defs)` exceeds a threshold (e.g. > 40 tools) **or** the serialized
++  size is very large, fall back to a compact `[{name, description}]` list and add
++  a `"_tools_truncated": true` marker so it's visible in the trace (don't
++  silently drop — per project convention, log/flag any capping).
++- Otherwise embed full defs.
++
++This keeps the rich rendering in the common case and degrades visibly in the
++rare large-toolset case.
++
++## Step 4 — Config toggle
++
++Add to `ObservabilityConfig` (`observability/config.py:50`):
++
++```python
++capture_tool_definitions: bool = Field(
++    default=True,
++    description="Embed the tool/function definitions offered to the LLM in the "
++                "generation's Langfuse input (renders as the Available-tools "
++                "section). When false, input is the bare messages list.",
++)
++```
++
++Read via `GlobalConfig().observability...` inside `_build_gen_input` (same access
++pattern `MCPBaseTool` already uses). Default `True` so the gap closes out of the
++box; flip to `False` to suppress for trace-size/noise control. Gating in the
++helper keeps the agents dumb — they always pass `tool_defs`, the helper decides.
++
++---
++
++## Files touched
++
++- `sgr_agent_core/agents/tool_calling_agent.py` — hoist `tool_defs`; wrap `input` via `_build_gen_input`.
++- `sgr_agent_core/agents/sgr_tool_calling_agent.py` — same, in both phases (reasoning + action).
++- `sgr_agent_core/base_agent.py` — add `_build_gen_input` (+ size-guard logic). No `_execution_step` change.
++- `sgr_agent_core/observability/config.py` — `capture_tool_definitions` flag.
++
++## Tests
++
++- New `tests/test_tool_definitions_in_traces.py`:
++  - Fake provider capturing `start_generation(input=...)`. Run an FC agent step;
++    assert `input["tools"]` contains the expected tool names + descriptions in
++    the `{"type":"function","function":{...}}` shape, and `input["messages"]` is
++    the chat list.
++  - Reasoning seam: assert the `ReasoningTool` def appears in the reasoning
++    generation's `input["tools"]`.
++  - `capture_tool_definitions=False` → `input` is the bare messages list (no
++    `tools` key) — regression guard for the old behaviour.
++  - Size guard: a toolset over the threshold → compact `[{name, description}]` +
++    `_tools_truncated` marker.
++  - NoOp provider path: no crash, no-op (extend `test_observability_noop_path.py`).
++- Confirm existing observability tests still pass — any test asserting `input ==
++  messages` for an FC generation must be updated to the object shape (or relaxed
++  to check `input["messages"]`).
++
++## Risks / notes
++
++- **Langfuse version.** The dedicated Available-tools section needs the Nov-2025
++  agent rendering. Older instances still work (tools show as JSON in input);
++  metadata is the fallback if needed. Worth a `notes/` entry once landed.
++- **Trace size.** Full schemas add bytes per generation. Mitigated by the flag +
++  the size guard in `_build_gen_input`.
++- **Per-iteration repetition.** The toolset is usually identical every
++  iteration, so it repeats across generations. Acceptable (each generation is
++  self-describing); a future optimization could log the set once on the trace
++  and only deltas per generation — out of scope here.
++- **`tool_choice`** is included as a cheap, useful extra (Langfuse shows it
++  alongside tools); drop if undesired.
++- **MCP descriptions** already flow correctly into the function defs, so once
++  this lands they appear in the input automatically — no MCP-side change.
++```
++
+diff --git a/scripts/langfuse_tool_trace_demo.py b/scripts/langfuse_tool_trace_demo.py
+new file mode 100644
+index 0000000..7dcf30e
+--- /dev/null
++++ b/scripts/langfuse_tool_trace_demo.py
+@@ -0,0 +1,121 @@
++"""Emit a real ToolCallingAgent trace to the local Langfuse instance.
++
++Demonstrates the tool-definitions-in-input feature: each action-selection
++generation carries its available tools in the `input` object so Langfuse renders
++the native "Available tools" section.
++
++Usage:
++    OPENAI_API_KEY=... uv run python scripts/langfuse_tool_trace_demo.py
++
++Requires the local Langfuse at http://localhost:3000 and the langfuse SDK
++(`uv pip install "langfuse>=2.0.0,<3.0.0"`).
++"""
++
++from __future__ import annotations
++
++import asyncio
++import os
++
++from openai import AsyncOpenAI
++from pydantic import Field
++
++from sgr_agent_core.agent_config import GlobalConfig
++from sgr_agent_core.agent_definition import AgentConfig, ExecutionConfig, LLMConfig, PromptsConfig
++from sgr_agent_core.agents import ToolCallingAgent
++from sgr_agent_core.base_tool import BaseTool
++from sgr_agent_core.observability import get_provider, init_provider
++from sgr_agent_core.observability.config import LangfuseConfig, ObservabilityConfig
++from sgr_agent_core.tools import FinalAnswerTool
++
++LANGFUSE_PUBLIC_KEY = "pk-lf-519ae97e-7f15-42fa-ab0f-42e7be77fd64"
++LANGFUSE_SECRET_KEY = "sk-lf-fa49d4be-6763-400d-9542-76736c056e65"
++LANGFUSE_HOST = "http://localhost:3000"
++
++
++class GetWeatherTool(BaseTool):
++    """Get the current weather for a given city."""
++
++    tool_name = "get_weather"
++    city: str = Field(description="The city to get the current weather for")
++
++    async def __call__(self, context, config, **kwargs) -> str:  # noqa: ANN001
++        # Offline mock so the demo needs no external API.
++        return f"The current weather in {self.city} is 18 degrees Celsius, partly cloudy."
++
++
++class CelsiusToFahrenheitTool(BaseTool):
++    """Convert a temperature from Celsius to Fahrenheit."""
++
++    tool_name = "celsius_to_fahrenheit"
++    celsius: float = Field(description="Temperature in degrees Celsius")
++
++    async def __call__(self, context, config, **kwargs) -> str:  # noqa: ANN001
++        return f"{self.celsius}C = {self.celsius * 9 / 5 + 32}F"
++
++
++def configure_observability() -> None:
++    gc = GlobalConfig()
++    gc.observability = ObservabilityConfig(
++        enabled=True,
++        provider="langfuse",
++        capture_tool_definitions=True,
++        langfuse=LangfuseConfig(
++            public_key=LANGFUSE_PUBLIC_KEY,
++            secret_key=LANGFUSE_SECRET_KEY,
++            base_url=LANGFUSE_HOST,
++            flush_at=1,
++            flush_interval=1.0,
++        ),
++    )
++    init_provider(gc)
++
++
++async def main() -> None:
++    api_key = os.environ.get("OPENAI_API_KEY")
++    if not api_key:
++        raise SystemExit("Set OPENAI_API_KEY to run this demo.")
++
++    configure_observability()
++
++    cfg = AgentConfig(
++        llm=LLMConfig(
++            api_key=api_key,
++            base_url="https://api.openai.com/v1",
++            model="gpt-4o-mini",
++            temperature=0.2,
++            max_tokens=2000,
++        ),
++        prompts=PromptsConfig(),  # bundled default prompts
++        execution=ExecutionConfig(max_iterations=8),
++    )
++
++    client = AsyncOpenAI(api_key=api_key, base_url="https://api.openai.com/v1")
++
++    task = (
++        "What is the weather in Paris right now? Then convert that temperature to "
++        "Fahrenheit, and give me a final answer summarizing both."
++    )
++
++    agent = ToolCallingAgent(
++        task_messages=[{"role": "user", "content": task}],
++        openai_client=client,
++        agent_config=cfg,
++        toolkit=[GetWeatherTool, CelsiusToFahrenheitTool, FinalAnswerTool],
++        def_name="weather_demo_agent",
++    )
++
++    result = await agent.execute()
++
++    provider = get_provider()
++    provider.flush()
++    provider.shutdown()
++
++    print("\n=== Agent result ===")
++    print(result)
++    print(f"\nTrace emitted to {LANGFUSE_HOST} (provider: {type(provider).__name__}).")
++    print("Open the Langfuse UI → latest trace 'weather_demo_agent' → an")
++    print("action-selection generation → Input: the 'Available tools' section.")
++
++
++if __name__ == "__main__":
++    asyncio.run(main())
+diff --git a/sgr_agent_core/agents/sgr_tool_calling_agent.py b/sgr_agent_core/agents/sgr_tool_calling_agent.py
+index 3b942c6..71e41bb 100644
+--- a/sgr_agent_core/agents/sgr_tool_calling_agent.py
++++ b/sgr_agent_core/agents/sgr_tool_calling_agent.py
+@@ -44,9 +44,10 @@ class SGRToolCallingAgent(BaseAgent):
+     async def _reasoning_phase(self) -> ReasoningTool:
+         phase_id = f"{self._context.iteration}-reasoning"
+         messages = await self._prepare_context()
++        tool_defs = [pydantic_function_tool(self.ReasoningTool, name=self.ReasoningTool.tool_name)]
+         async with self.openai_client.chat.completions.stream(
+             messages=messages,
+-            tools=[pydantic_function_tool(self.ReasoningTool, name=self.ReasoningTool.tool_name)],
++            tools=tool_defs,
+             tool_choice=self.tool_choice,
+             **self.config.llm.to_openai_client_kwargs(),
+         ) as stream:
+@@ -63,7 +64,7 @@ class SGRToolCallingAgent(BaseAgent):
+             "model": self.config.llm.model,
+             "model_parameters": {"temperature": self.config.llm.temperature, "max_tokens": self.config.llm.max_tokens},
+             "usage": {"input": usage.prompt_tokens, "output": usage.completion_tokens} if usage else None,
+-            "input": messages,
++            "input": self._build_gen_input(messages, tool_defs),
+             "output": response_msg.content or self._truncate(reasoning.model_dump_json()),
+         }
+         self.streaming_generator.add_tool_call(phase_id, reasoning)
+@@ -92,9 +93,10 @@ class SGRToolCallingAgent(BaseAgent):
+     async def _select_action_phase(self, reasoning: ReasoningTool) -> BaseTool:
+         phase_id = f"{self._context.iteration}-action"
+         messages = await self._prepare_context()
++        tool_defs = await self._prepare_tools()
+         async with self.openai_client.chat.completions.stream(
+             messages=messages,
+-            tools=await self._prepare_tools(),
++            tools=tool_defs,
+             tool_choice=self.tool_choice,
+             **self.config.llm.to_openai_client_kwargs(),
+         ) as stream:
+@@ -110,7 +112,7 @@ class SGRToolCallingAgent(BaseAgent):
+             "model": self.config.llm.model,
+             "model_parameters": {"temperature": self.config.llm.temperature, "max_tokens": self.config.llm.max_tokens},
+             "usage": {"input": usage.prompt_tokens, "output": usage.completion_tokens} if usage else None,
+-            "input": messages,
++            "input": self._build_gen_input(messages, tool_defs),
+             "output": self._truncate(response_msg.content or str(response_msg.tool_calls)),
+         }
+         try:
+diff --git a/sgr_agent_core/agents/tool_calling_agent.py b/sgr_agent_core/agents/tool_calling_agent.py
+index 98f6117..56d6f0a 100644
+--- a/sgr_agent_core/agents/tool_calling_agent.py
++++ b/sgr_agent_core/agents/tool_calling_agent.py
+@@ -41,9 +41,10 @@ class ToolCallingAgent(BaseAgent):
+     async def _select_action_phase(self, reasoning=None) -> BaseTool:
+         phase_id = f"{self._context.iteration}-action"
+         messages = await self._prepare_context()
++        tool_defs = await self._prepare_tools()
+         async with self.openai_client.chat.completions.stream(
+             messages=messages,
+-            tools=await self._prepare_tools(),
++            tools=tool_defs,
+             tool_choice=self.tool_choice,
+             **self.config.llm.to_openai_client_kwargs(),
+         ) as stream:
+@@ -59,7 +60,7 @@ class ToolCallingAgent(BaseAgent):
+             "model": self.config.llm.model,
+             "model_parameters": {"temperature": self.config.llm.temperature, "max_tokens": self.config.llm.max_tokens},
+             "usage": {"input": usage.prompt_tokens, "output": usage.completion_tokens} if usage else None,
+-            "input": messages,
++            "input": self._build_gen_input(messages, tool_defs),
+             "output": self._truncate(response_msg.content or str(response_msg.tool_calls)),
+         }
+         tool = completion.choices[0].message.tool_calls[0].function.parsed_arguments
+diff --git a/sgr_agent_core/base_agent.py b/sgr_agent_core/base_agent.py
+index bb5ffe1..9e64de9 100644
+--- a/sgr_agent_core/base_agent.py
++++ b/sgr_agent_core/base_agent.py
+@@ -47,6 +47,10 @@ class BaseAgent(AgentRegistryMixin):
+ 
+     name: str = "base_agent"
+ 
++    # Above this many tool defs, traced input degrades to compact name+description
++    # (see _build_gen_input) to keep Langfuse traces from bloating.
++    _MAX_TRACED_TOOL_DEFS: int = 40
++
+     def __init__(
+         self,
+         task_messages: list[ChatCompletionMessageParam],
+@@ -254,6 +258,49 @@ class BaseAgent(AgentRegistryMixin):
+             tools = {t for t in tools if t.tool_name not in drop}
+         return [pydantic_function_tool(tool, name=tool.tool_name) for tool in tools]
+ 
++    def _build_gen_input(
++        self,
++        messages: list,
++        tool_defs: list[ChatCompletionFunctionToolParam] | None,
++        tool_choice: Any = None,
++    ) -> Any:
++        """Shape the generation ``input`` so Langfuse renders an Available-tools section.
++
++        Returns the OpenAI-request object ``{messages, tools, tool_choice}`` when
++        tool capture is enabled and tools exist; otherwise the bare ``messages``
++        list (unchanged behaviour, e.g. NoOp / structured-output paths).
++
++        The tool defs are kept in the full ``{"type": "function", "function": {...}}``
++        shape — that is what Langfuse's tool renderer keys on — except when the
++        toolset is large enough to bloat the trace, in which case they degrade to
++        a compact ``[{name, description}]`` list flagged with ``_tools_truncated``.
++        """
++        from sgr_agent_core.agent_config import GlobalConfig
++
++        if not tool_defs or not GlobalConfig().observability.capture_tool_definitions:
++            return messages
++
++        payload: dict[str, Any] = {"messages": messages}
++        # Degrade gracefully for pathologically large toolsets: keep names +
++        # descriptions but drop the full schemas, and flag it so the capping is
++        # visible in the trace rather than silent.
++        if len(tool_defs) > self._MAX_TRACED_TOOL_DEFS:
++            payload["tools"] = [
++                {
++                    "name": (fn := td.get("function", td)).get("name"),
++                    "description": fn.get("description", ""),
++                }
++                for td in tool_defs
++            ]
++            payload["_tools_truncated"] = True
++        else:
++            payload["tools"] = tool_defs
++
++        tc = tool_choice if tool_choice is not None else getattr(self, "tool_choice", None)
++        if tc is not None:
++            payload["tool_choice"] = tc
++        return payload
++
+     async def _reasoning_phase(self) -> ReasoningTool:
+         """Call LLM to decide next action based on current context."""
+         raise NotImplementedError("_reasoning_phase must be implemented by subclass")
+diff --git a/sgr_agent_core/observability/config.py b/sgr_agent_core/observability/config.py
+index 8f6cc55..59b5633 100644
+--- a/sgr_agent_core/observability/config.py
++++ b/sgr_agent_core/observability/config.py
+@@ -58,6 +58,12 @@ class ObservabilityConfig(BaseModel):
+         default="langfuse",
+         description="Observability provider. Currently supported: 'langfuse', 'noop'.",
+     )
++    capture_tool_definitions: bool = Field(
++        default=True,
++        description="Embed the tool/function definitions offered to the LLM in the generation's "
++        "Langfuse input (renders as the Available-tools section). When false, input is the bare "
++        "messages list.",
++    )
+     langfuse: LangfuseConfig = Field(default_factory=LangfuseConfig)
+     metrics_processors: list[dict[str, Any]] = Field(
+         default_factory=list,
+diff --git a/tests/test_tool_definitions_in_traces.py b/tests/test_tool_definitions_in_traces.py
+new file mode 100644
+index 0000000..95d5e44
+--- /dev/null
++++ b/tests/test_tool_definitions_in_traces.py
+@@ -0,0 +1,119 @@
++"""Tests for tool definitions captured in Langfuse generation input.
++
++Covers ``BaseAgent._build_gen_input`` — the single chokepoint that shapes the
++generation ``input`` so Langfuse renders an Available-tools section.
++"""
++
++from unittest.mock import Mock
++
++from openai import AsyncOpenAI, pydantic_function_tool
++from pydantic import Field
++
++from sgr_agent_core.agent_config import GlobalConfig
++from sgr_agent_core.agent_definition import AgentConfig, ExecutionConfig, LLMConfig, PromptsConfig
++from sgr_agent_core.agents import ToolCallingAgent
++from sgr_agent_core.tools import BaseTool
++
++
++class _SampleTool(BaseTool):
++    """Look something up by query."""
++
++    tool_name = "sample_tool"
++    query: str = Field(description="the search query")
++
++
++def _make_agent() -> ToolCallingAgent:
++    cfg = AgentConfig(
++        llm=LLMConfig(api_key="k", base_url="https://api.openai.com/v1"),
++        prompts=PromptsConfig(
++            system_prompt_str="p",
++            initial_user_request_str="p",
++            clarification_response_str="p",
++        ),
++        execution=ExecutionConfig(),
++    )
++    return ToolCallingAgent(
++        task_messages=[{"role": "user", "content": "hi"}],
++        openai_client=Mock(spec=AsyncOpenAI),
++        agent_config=cfg,
++        toolkit=[_SampleTool],
++    )
++
++
++def _sample_tool_defs(n: int = 1) -> list[dict]:
++    one = dict(pydantic_function_tool(_SampleTool, name="sample_tool"))
++    return [dict(one) for _ in range(n)]
++
++
++def test_tools_embedded_as_request_object(monkeypatch):
++    """With capture on, input becomes {messages, tools, tool_choice} and tools
++    keep the full {"type": "function", "function": {...}} shape Langfuse needs."""
++    monkeypatch.setattr(GlobalConfig().observability, "capture_tool_definitions", True)
++    agent = _make_agent()
++    messages = [{"role": "user", "content": "hi"}]
++    tool_defs = _sample_tool_defs()
++
++    result = agent._build_gen_input(messages, tool_defs)
++
++    assert isinstance(result, dict)
++    assert result["messages"] is messages
++    assert result["tool_choice"] == "required"
++    assert "_tools_truncated" not in result
++
++    fn = result["tools"][0]["function"]
++    assert fn["name"] == "sample_tool"
++    assert "look something up" in fn["description"].lower()
++    # full schema preserved so the LLM-visible parameters render too
++    assert "query" in fn["parameters"]["properties"]
++
++
++def test_reasoning_tool_def_is_captured(monkeypatch):
++    """The single ReasoningTool def offered in the reasoning seam is captured."""
++    from sgr_agent_core.tools import ReasoningTool
++
++    monkeypatch.setattr(GlobalConfig().observability, "capture_tool_definitions", True)
++    agent = _make_agent()
++    messages = [{"role": "user", "content": "hi"}]
++    tool_defs = [dict(pydantic_function_tool(ReasoningTool, name=ReasoningTool.tool_name))]
++
++    result = agent._build_gen_input(messages, tool_defs)
++
++    names = [t["function"]["name"] for t in result["tools"]]
++    assert ReasoningTool.tool_name in names
++
++
++def test_capture_disabled_returns_bare_messages(monkeypatch):
++    """With capture off, input is the unchanged bare messages list."""
++    monkeypatch.setattr(GlobalConfig().observability, "capture_tool_definitions", False)
++    agent = _make_agent()
++    messages = [{"role": "user", "content": "hi"}]
++
++    result = agent._build_gen_input(messages, _sample_tool_defs())
++
++    assert result is messages
++
++
++def test_no_tools_returns_bare_messages(monkeypatch):
++    """Empty/None tool defs (e.g. structured-output path) leave input untouched."""
++    monkeypatch.setattr(GlobalConfig().observability, "capture_tool_definitions", True)
++    agent = _make_agent()
++    messages = [{"role": "user", "content": "hi"}]
++
++    assert agent._build_gen_input(messages, []) is messages
++    assert agent._build_gen_input(messages, None) is messages
++
++
++def test_large_toolset_degrades_to_compact(monkeypatch):
++    """Beyond the cap, tools degrade to compact name+description and flag it."""
++    monkeypatch.setattr(GlobalConfig().observability, "capture_tool_definitions", True)
++    agent = _make_agent()
++    messages = [{"role": "user", "content": "hi"}]
++    tool_defs = _sample_tool_defs(agent._MAX_TRACED_TOOL_DEFS + 1)
++
++    result = agent._build_gen_input(messages, tool_defs)
++
++    assert result["_tools_truncated"] is True
++    assert len(result["tools"]) == len(tool_defs)
++    first = result["tools"][0]
++    assert set(first.keys()) == {"name", "description"}
++    assert first["name"] == "sample_tool"
