@@ -47,6 +47,10 @@ class BaseAgent(AgentRegistryMixin):
 
     name: str = "base_agent"
 
+    # Above this many tool defs, traced input degrades to compact name+description
+    # (see _build_gen_input) to keep Langfuse traces from bloating.
+    _MAX_TRACED_TOOL_DEFS: int = 40
+
     def __init__(
         self,
         task_messages: list[ChatCompletionMessageParam],
@@ -253,6 +257,49 @@ class BaseAgent(AgentRegistryMixin):
             )
             tools = {t for t in tools if t.tool_name not in drop}
         return [pydantic_function_tool(tool, name=tool.tool_name) for tool in tools]
+
+    def _build_gen_input(
+        self,
+        messages: list,
+        tool_defs: list[ChatCompletionFunctionToolParam] | None,
+        tool_choice: Any = None,
+    ) -> Any:
+        """Shape the generation ``input`` so Langfuse renders an Available-tools section.
+
+        Returns the OpenAI-request object ``{messages, tools, tool_choice}`` when
+        tool capture is enabled and tools exist; otherwise the bare ``messages``
+        list (unchanged behaviour, e.g. NoOp / structured-output paths).
+
+        The tool defs are kept in the full ``{"type": "function", "function": {...}}``
+        shape — that is what Langfuse's tool renderer keys on — except when the
+        toolset is large enough to bloat the trace, in which case they degrade to
+        a compact ``[{name, description}]`` list flagged with ``_tools_truncated``.
+        """
+        from sgr_agent_core.agent_config import GlobalConfig
+
+        if not tool_defs or not GlobalConfig().observability.capture_tool_definitions:
+            return messages
+
+        payload: dict[str, Any] = {"messages": messages}
+        # Degrade gracefully for pathologically large toolsets: keep names +
+        # descriptions but drop the full schemas, and flag it so the capping is
+        # visible in the trace rather than silent.
+        if len(tool_defs) > self._MAX_TRACED_TOOL_DEFS:
+            payload["tools"] = [
+                {
+                    "name": (fn := td.get("function", td)).get("name"),
+                    "description": fn.get("description", ""),
+                }
+                for td in tool_defs
+            ]
+            payload["_tools_truncated"] = True
+        else:
+            payload["tools"] = tool_defs
+
+        tc = tool_choice if tool_choice is not None else getattr(self, "tool_choice", None)
+        if tc is not None:
+            payload["tool_choice"] = tc
+        return payload
 
     async def _reasoning_phase(self) -> ReasoningTool:
         """Call LLM to decide next action based on current context."""

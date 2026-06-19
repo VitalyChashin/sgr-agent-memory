@@ -58,6 +58,12 @@ class ObservabilityConfig(BaseModel):
         default="langfuse",
         description="Observability provider. Currently supported: 'langfuse', 'noop'.",
     )
+    capture_tool_definitions: bool = Field(
+        default=True,
+        description="Embed the tool/function definitions offered to the LLM in the generation's "
+        "Langfuse input (renders as the Available-tools section). When false, input is the bare "
+        "messages list.",
+    )
     langfuse: LangfuseConfig = Field(default_factory=LangfuseConfig)
     metrics_processors: list[dict[str, Any]] = Field(
         default_factory=list,
