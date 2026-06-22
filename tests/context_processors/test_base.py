@@ -91,17 +91,41 @@ class TestChainPrepareTools:
     async def test_system_tools_never_dropped(self, mock_context, mock_config):
         chain = AgentContextProcessorChain([DropEverythingProcessor()])
         toolkit = [StubWorkTool, StubSystemTool]
-        drop = await chain.run_prepare_tools(toolkit, mock_context, mock_config)
-        assert StubWorkTool.tool_name in drop
-        assert StubSystemTool.tool_name not in drop
+        result = await chain.run_prepare_tools(toolkit, mock_context, mock_config)
+        assert StubWorkTool.tool_name in result.drop
+        assert StubSystemTool.tool_name not in result.drop
 
     @pytest.mark.asyncio
     async def test_throwing_processor_is_fail_safe(self, mock_context, mock_config):
         chain = AgentContextProcessorChain([ThrowingProcessor(), DropEverythingProcessor()])
         toolkit = [StubWorkTool]
         # ThrowingProcessor contributes nothing; DropEverythingProcessor still drops.
-        drop = await chain.run_prepare_tools(toolkit, mock_context, mock_config)
-        assert drop == {StubWorkTool.tool_name}
+        result = await chain.run_prepare_tools(toolkit, mock_context, mock_config)
+        assert result.drop == {StubWorkTool.tool_name}
+
+    @pytest.mark.asyncio
+    async def test_legacy_set_return_still_supported(self, mock_context, mock_config):
+        # DropEverythingProcessor returns a bare set[str]; the chain coerces it.
+        chain = AgentContextProcessorChain([DropEverythingProcessor()])
+        result = await chain.run_prepare_tools([StubWorkTool], mock_context, mock_config)
+        assert result.drop == {StubWorkTool.tool_name}
+        assert result.inject_messages == []
+
+    @pytest.mark.asyncio
+    async def test_inject_messages_flow_through(self, mock_context, mock_config):
+        from sgr_agent_core.context_processors.base import PrepareToolsResult
+
+        class InjectProcessor(AgentContextProcessor):
+            async def on_prepare_tools(self, *, toolkit, context, config, **kw):
+                return PrepareToolsResult(
+                    drop={StubWorkTool.tool_name},
+                    inject_messages=[{"role": "user", "content": "disabled"}],
+                )
+
+        chain = AgentContextProcessorChain([InjectProcessor()])
+        result = await chain.run_prepare_tools([StubWorkTool], mock_context, mock_config)
+        assert result.drop == {StubWorkTool.tool_name}
+        assert result.inject_messages == [{"role": "user", "content": "disabled"}]
 
 
 class TestChainBeforeFinish:

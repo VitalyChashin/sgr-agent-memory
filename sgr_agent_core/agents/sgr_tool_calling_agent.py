@@ -92,8 +92,10 @@ class SGRToolCallingAgent(BaseAgent):
 
     async def _select_action_phase(self, reasoning: ReasoningTool) -> BaseTool:
         phase_id = f"{self._context.iteration}-action"
-        messages = await self._prepare_context()
+        # Prepare tools first: the prepare-tools seam may drop tools and inject
+        # directives into the conversation, which _prepare_context must then snapshot.
         tool_defs = await self._prepare_tools()
+        messages = await self._prepare_context()
         async with self.openai_client.chat.completions.stream(
             messages=messages,
             tools=tool_defs,

@@ -86,6 +86,42 @@ async def test_repeated_tool_call_guard_breaks_retry_loop():
 
 
 @pytest.mark.asyncio
+async def test_repeated_tool_call_guard_announces_drop_once():
+    """When the guard drops a tool with announce, a 'disabled' directive is injected once."""
+    failing = LeafSearchTool(query="same")
+    final = FinalAnswerTool(
+        reasoning="forced to finish", completed_steps=["gave up"], answer="done", status=AgentStatesEnum.COMPLETED
+    )
+
+    client = Mock(spec=AsyncOpenAI)
+
+    def mock_stream(**kwargs):
+        return _stream_for(failing if LeafSearchTool.tool_name in _tool_names(kwargs) else final)
+
+    client.chat.completions.stream = Mock(side_effect=mock_stream)
+
+    agent = ToolCallingAgent(
+        task_messages=[{"role": "user", "content": "go"}],
+        openai_client=client,
+        agent_config=_agent_config(
+            [{"class": "RepeatedToolCallGuard", "config": {"max_repeats": 3, "announce": True}}]
+        ),
+        toolkit=[LeafSearchTool, FinalAnswerTool],
+    )
+
+    result = await agent.execute()
+
+    assert result == "done"
+    # The "tool disabled" directive was injected exactly once, naming the dropped tool.
+    directives = [
+        m
+        for m in agent.conversation
+        if m.get("role") == "user" and LeafSearchTool.tool_name in str(m.get("content", ""))
+    ]
+    assert len(directives) == 1
+
+
+@pytest.mark.asyncio
 async def test_mandatory_tool_call_vetoes_self_answer():
     """Router answers itself; the processor vetoes once and forces a work call first."""
     delegate = DelegateTool(task="search")

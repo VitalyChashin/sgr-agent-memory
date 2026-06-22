@@ -14,6 +14,7 @@ from sgr_agent_core.context_processors.base import (
     AgentContextProcessorRegistry,
     ContextProcessorDefinition,
     FinishDecision,
+    PrepareToolsResult,
     build_context_processor_chain,
     emit_event_span,
 )
@@ -26,6 +27,7 @@ __all__ = [
     "AgentContextProcessorRegistry",
     "ContextProcessorDefinition",
     "FinishDecision",
+    "PrepareToolsResult",
     "build_context_processor_chain",
     "emit_event_span",
     "RepeatedToolCallGuard",

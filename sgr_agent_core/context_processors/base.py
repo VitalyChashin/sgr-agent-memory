@@ -51,6 +51,37 @@ class FinishDecision:
     reason: str | None = None
 
 
+@dataclass
+class PrepareToolsResult:
+    """Outcome of the ``on_prepare_tools`` seam.
+
+    ``drop`` are tool names removed from the toolkit before selection.
+    ``inject_messages`` are OpenAI message dicts appended to the conversation so
+    the directive reaches the **same** iteration's action-selection call (the
+    agent prepares tools before context — see the reorder in the FC agents).
+    """
+
+    drop: set[str] = field(default_factory=set)
+    inject_messages: list[dict[str, Any]] = field(default_factory=list)
+
+    @classmethod
+    def coerce(cls, value: Any) -> PrepareToolsResult:
+        """Normalize a hook return into a ``PrepareToolsResult``.
+
+        Accepts a legacy ``set[str]`` (drops only, no messages), an existing
+        ``PrepareToolsResult``, or ``None``/falsey (empty result).
+        """
+        if isinstance(value, PrepareToolsResult):
+            return value
+        if not value:
+            return cls()
+        if isinstance(value, (set, frozenset, list, tuple)):
+            return cls(drop=set(value))
+        # Unknown shape: ignore defensively rather than crash the seam.
+        logger.warning("on_prepare_tools returned unexpected type %s; ignoring.", type(value).__name__)
+        return cls()
+
+
 class AgentContextProcessorRegistry(Registry["AgentContextProcessor"]):
     """Registry for agent context processor classes."""
 
@@ -99,8 +130,13 @@ class AgentContextProcessor(ABC):
         context: AgentContext,
         config: AgentConfig,
         **kw: Any,
-    ) -> set[str]:
-        """Called before tool selection. Return tool names to drop."""
+    ) -> set[str] | PrepareToolsResult:
+        """Called before tool selection.
+
+        Return a ``set[str]`` of tool names to drop (legacy), or a
+        :class:`PrepareToolsResult` to also inject conversation messages (e.g. a
+        "tool X disabled" directive) into the *same* iteration's selection call.
+        """
         return set()
 
     async def on_before_finish(
@@ -170,27 +206,35 @@ class AgentContextProcessorChain:
         *,
         provider: Any = None,
         parent_span: Any = None,
-    ) -> set[str]:
+    ) -> PrepareToolsResult:
         drop: set[str] = set()
+        inject_messages: list[dict[str, Any]] = []
         for p in self.processors:
             p_provider, span = self._span_setup(p, provider, parent_span, "on_prepare_tools")
             try:
-                dropped = await p.on_prepare_tools(
-                    toolkit=toolkit,
-                    context=context,
-                    config=config,
-                    provider=p_provider,
-                    parent_span=parent_span,
+                result = PrepareToolsResult.coerce(
+                    await p.on_prepare_tools(
+                        toolkit=toolkit,
+                        context=context,
+                        config=config,
+                        provider=p_provider,
+                        parent_span=parent_span,
+                    )
                 )
-                drop |= dropped
-                processor_span_end(p_provider, span, output={"dropped": sorted(dropped)})
+                drop |= result.drop
+                inject_messages.extend(result.inject_messages)
+                processor_span_end(
+                    p_provider,
+                    span,
+                    output={"dropped": sorted(result.drop), "injected": len(result.inject_messages)},
+                )
             except Exception as e:
-                # Fail-safe: this processor contributes no drops, agent keeps full toolkit.
+                # Fail-safe: this processor contributes no drops/messages, agent keeps full toolkit.
                 processor_span_end(p_provider, span, output={"error": str(e)}, level="ERROR")
                 logger.warning("ctx-proc %s.on_prepare_tools failed: %s: %s", type(p).__name__, type(e).__name__, e)
         # NEVER drop system/terminal tools — the agent must always be able to finish.
         system_names = {t.tool_name for t in toolkit if getattr(t, "isSystemTool", False)}
-        return drop - system_names
+        return PrepareToolsResult(drop=drop - system_names, inject_messages=inject_messages)
 
     async def run_before_finish(
         self,

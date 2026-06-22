@@ -29,12 +29,15 @@ Close each by setting it resolved here (keep the node) once the plan/implementat
    `RepeatedToolCallGuard` counts every call by default and exposes `failed_only: bool`
    (`repeated_tool_call_guard.py`) to narrow to results starting with `"Error:"`.
 
-3. **Drop-tool vs instruct.** **Partially resolved 2026-06-13.** v1 ships the deterministic
-   *drop* (`on_prepare_tools` returns tool names to drop). The softer *instruct* path is
-   **deferred**: the prepare-tools seam returns only a `set[str]` and has no message-injection
-   channel (only `on_before_finish` injects). `RepeatedToolCallGuard` accepts an `announce`
-   flag but it currently only tags the emitted span — conversation injection of a "tool X
-   disabled" note still needs a seam that can mutate the conversation. Reopen if needed.
+3. ~~**Drop-tool vs instruct.**~~ **RESOLVED 2026-06-22.** The prepare-tools seam now
+   carries a message-injection channel: `on_prepare_tools` may return a `PrepareToolsResult`
+   (`drop` + `inject_messages`) instead of a bare `set[str]` (legacy sets still accepted via
+   `PrepareToolsResult.coerce`). `base_agent._prepare_tools` appends the injected messages to
+   the conversation, and the two FC agents (`tool_calling_agent`, `sgr_tool_calling_agent`)
+   now prepare tools **before** context so the directive reaches the *same* iteration's
+   action-selection call. `RepeatedToolCallGuard.announce` injects a one-time "tool X disabled"
+   directive (configurable `message`, `{tool}` placeholder), gated by an `_announced` set.
+   See `plans/prepare-tools-message-injection.md` and `notes/prepare-tools-injection.md`.
 
 4. **Provider / gateway side-effects of a shrinking tool list.** STILL OPEN. Dropping a tool
    mid-run is implemented and unit/loop tested, but the interaction with prompt/tool-list

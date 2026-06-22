@@ -18,7 +18,7 @@ class TestCounting:
         tool = StubWorkTool(query="same")
         await _feed(guard, tool, mock_context, mock_config, 3)
         drop = await guard.on_prepare_tools(toolkit=[StubWorkTool], context=mock_context, config=mock_config)
-        assert drop == {StubWorkTool.tool_name}
+        assert drop.drop == {StubWorkTool.tool_name}
 
     @pytest.mark.asyncio
     async def test_exact_args_distinguishes_args(self, mock_context, mock_config):
@@ -28,7 +28,7 @@ class TestCounting:
             await guard.on_tool_end(tool=tool, result="ok", context=mock_context, config=mock_config)
         # Three distinct arg-sets, each counted once → nothing crosses the threshold.
         drop = await guard.on_prepare_tools(toolkit=[StubWorkTool], context=mock_context, config=mock_config)
-        assert drop == set()
+        assert drop.drop == set()
 
     @pytest.mark.asyncio
     async def test_tool_name_scope_counts_regardless_of_args(self, mock_context, mock_config):
@@ -37,7 +37,7 @@ class TestCounting:
             tool = StubWorkTool(query=f"q{i}")
             await guard.on_tool_end(tool=tool, result="ok", context=mock_context, config=mock_config)
         drop = await guard.on_prepare_tools(toolkit=[StubWorkTool], context=mock_context, config=mock_config)
-        assert drop == {StubWorkTool.tool_name}
+        assert drop.drop == {StubWorkTool.tool_name}
 
     @pytest.mark.asyncio
     async def test_below_threshold_not_dropped(self, mock_context, mock_config):
@@ -45,7 +45,7 @@ class TestCounting:
         tool = StubWorkTool(query="x")
         await _feed(guard, tool, mock_context, mock_config, 2)
         drop = await guard.on_prepare_tools(toolkit=[StubWorkTool], context=mock_context, config=mock_config)
-        assert drop == set()
+        assert drop.drop == set()
 
 
 class TestFailedOnly:
@@ -56,7 +56,7 @@ class TestFailedOnly:
         await guard.on_tool_end(tool=tool, result="ok", context=mock_context, config=mock_config)
         await guard.on_tool_end(tool=tool, result="ok", context=mock_context, config=mock_config)
         drop = await guard.on_prepare_tools(toolkit=[StubWorkTool], context=mock_context, config=mock_config)
-        assert drop == set()
+        assert drop.drop == set()
 
     @pytest.mark.asyncio
     async def test_failed_only_counts_errors(self, mock_context, mock_config):
@@ -64,7 +64,7 @@ class TestFailedOnly:
         tool = StubFailingTool(query="x")
         await _feed(guard, tool, mock_context, mock_config, 2)
         drop = await guard.on_prepare_tools(toolkit=[StubFailingTool], context=mock_context, config=mock_config)
-        assert drop == {StubFailingTool.tool_name}
+        assert drop.drop == {StubFailingTool.tool_name}
 
 
 class TestSystemTools:
@@ -74,7 +74,7 @@ class TestSystemTools:
         tool = StubSystemTool(payload="x")
         await _feed(guard, tool, mock_context, mock_config, 5)
         drop = await guard.on_prepare_tools(toolkit=[StubSystemTool], context=mock_context, config=mock_config)
-        assert drop == set()
+        assert drop.drop == set()
 
 
 class TestEmission:
@@ -109,4 +109,44 @@ class TestEmission:
         drop = await guard.on_prepare_tools(
             toolkit=[StubWorkTool], context=mock_context, config=mock_config, provider=NoOpProvider()
         )
-        assert drop == {StubWorkTool.tool_name}
+        assert drop.drop == {StubWorkTool.tool_name}
+
+
+class TestAnnounce:
+    @pytest.mark.asyncio
+    async def test_announce_injects_directive_once(self, mock_context, mock_config):
+        guard = RepeatedToolCallGuard({"max_repeats": 2, "scope": "tool_name", "announce": True})
+        tool = StubWorkTool(query="x")
+        await _feed(guard, tool, mock_context, mock_config, 2)
+
+        # First drop turn → directive injected once, naming the tool.
+        first = await guard.on_prepare_tools(toolkit=[StubWorkTool], context=mock_context, config=mock_config)
+        assert first.drop == {StubWorkTool.tool_name}
+        assert len(first.inject_messages) == 1
+        msg = first.inject_messages[0]
+        assert msg["role"] == "user"
+        assert StubWorkTool.tool_name in msg["content"]
+
+        # Subsequent turns still drop the tool but never re-announce.
+        second = await guard.on_prepare_tools(toolkit=[StubWorkTool], context=mock_context, config=mock_config)
+        assert second.drop == {StubWorkTool.tool_name}
+        assert second.inject_messages == []
+
+    @pytest.mark.asyncio
+    async def test_announce_false_injects_nothing(self, mock_context, mock_config):
+        guard = RepeatedToolCallGuard({"max_repeats": 1, "scope": "tool_name", "announce": False})
+        tool = StubWorkTool(query="x")
+        await _feed(guard, tool, mock_context, mock_config, 1)
+        result = await guard.on_prepare_tools(toolkit=[StubWorkTool], context=mock_context, config=mock_config)
+        assert result.drop == {StubWorkTool.tool_name}
+        assert result.inject_messages == []
+
+    @pytest.mark.asyncio
+    async def test_custom_message_template(self, mock_context, mock_config):
+        guard = RepeatedToolCallGuard(
+            {"max_repeats": 1, "scope": "tool_name", "announce": True, "message": "stop using {tool} now"}
+        )
+        tool = StubWorkTool(query="x")
+        await _feed(guard, tool, mock_context, mock_config, 1)
+        result = await guard.on_prepare_tools(toolkit=[StubWorkTool], context=mock_context, config=mock_config)
+        assert result.inject_messages[0]["content"] == f"stop using {StubWorkTool.tool_name} now"

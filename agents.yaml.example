@@ -142,6 +142,10 @@ agents:
           max_repeats: 3
           scope: "exact_args"   # or "tool_name"
           failed_only: false    # true = only count results starting with "Error:"
+          announce: true        # inject a one-time "tool disabled" directive into the
+                                # conversation when a tool is dropped, so the model is
+                                # told why it vanished (instead of silently reconciling).
+          # message: "The tool '{tool}' has been disabled after repeated failed calls. ..."
 
   # Example 5: Agent using inline prompts instead of files
   inline_prompt_agent:

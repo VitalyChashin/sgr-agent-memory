@@ -62,16 +62,16 @@ class TestSpanModeAlways:
         await chain.run_prepare_tools([StubWorkTool], mock_context, mock_config, provider=provider)
 
         assert [s["name"] for s in provider.started] == ["ctx-processor.DropWorkProcessor.on_prepare_tools"]
-        assert provider.ended[0]["output"] == {"dropped": [StubWorkTool.tool_name]}
+        assert provider.ended[0]["output"] == {"dropped": [StubWorkTool.tool_name], "injected": 0}
         assert provider.ended[0]["level"] == "DEFAULT"
 
     @pytest.mark.asyncio
     async def test_throwing_processor_span_is_error_and_fail_safe(self, mock_context, mock_config):
         provider = RecordingProvider()
         chain = AgentContextProcessorChain([_set_mode(BoomPrepareProcessor(), "always")])
-        drop = await chain.run_prepare_tools([StubWorkTool], mock_context, mock_config, provider=provider)
+        result = await chain.run_prepare_tools([StubWorkTool], mock_context, mock_config, provider=provider)
 
-        assert drop == set()  # fail-safe: no drops contributed
+        assert result.drop == set()  # fail-safe: no drops contributed
         assert provider.ended[0]["level"] == "ERROR"
         assert "error" in provider.ended[0]["output"]
 

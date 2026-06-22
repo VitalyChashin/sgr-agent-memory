@@ -14,7 +14,7 @@ import json
 import logging
 from typing import TYPE_CHECKING, Any
 
-from sgr_agent_core.context_processors.base import AgentContextProcessor, emit_event_span
+from sgr_agent_core.context_processors.base import AgentContextProcessor, PrepareToolsResult, emit_event_span
 
 if TYPE_CHECKING:
     from sgr_agent_core.agent_definition import AgentConfig
@@ -22,6 +22,12 @@ if TYPE_CHECKING:
     from sgr_agent_core.models import AgentContext
 
 logger = logging.getLogger(__name__)
+
+_DEFAULT_MESSAGE = (
+    "The tool '{tool}' has been disabled after repeated failed calls. Do not "
+    "attempt to call it again — finalize your answer with the information you "
+    "already have."
+)
 
 
 class RepeatedToolCallGuard(AgentContextProcessor):
@@ -33,9 +39,12 @@ class RepeatedToolCallGuard(AgentContextProcessor):
             all calls of the same tool name. Default "exact_args".
         failed_only (bool): only count calls whose result starts with "Error:".
             Default False.
-        announce (bool): reserved for an optional "tool disabled" note. The
-            prepare-tools seam has no message channel today, so this only tags
-            the emitted span; conversation injection is deferred (gap #3).
+        announce (bool): inject a one-time "tool disabled" directive into the
+            conversation the first time each tool is dropped, so the model learns
+            why the tool vanished instead of reconciling a silent contradiction.
+            Default True.
+        message (str): template for the injected directive; ``{tool}`` is
+            substituted with the dropped tool name.
     """
 
     def __init__(self, processor_config: dict[str, Any] | None = None):
@@ -44,8 +53,11 @@ class RepeatedToolCallGuard(AgentContextProcessor):
         self.scope = self.processor_config.get("scope", "exact_args")
         self.failed_only = bool(self.processor_config.get("failed_only", False))
         self.announce = bool(self.processor_config.get("announce", True))
+        self.message = self.processor_config.get("message", _DEFAULT_MESSAGE)
         self._counts: dict[str, int] = {}
         self._key_tool: dict[str, str] = {}
+        # Tools whose "disabled" directive has already been injected (announce once).
+        self._announced: set[str] = set()
 
     def _key(self, tool: BaseTool) -> str:
         if self.scope == "tool_name":
@@ -79,12 +91,18 @@ class RepeatedToolCallGuard(AgentContextProcessor):
         provider: Any = None,
         parent_span: Any = None,
         **kw: Any,
-    ) -> set[str]:
+    ) -> PrepareToolsResult:
         # Map every crossed key back to its tool name.
         crossed = {k: c for k, c in self._counts.items() if c >= self.max_repeats}
         drop = {self._key_tool[k] for k in crossed}
+        inject_messages: list[dict[str, Any]] = []
         for name in sorted(drop):
             count = max(c for k, c in crossed.items() if self._key_tool[k] == name)
+            # Announce each dropped tool exactly once, on the turn it first crosses.
+            announced_now = self.announce and name not in self._announced
+            if announced_now:
+                self._announced.add(name)
+                inject_messages.append({"role": "user", "content": self.message.format(tool=name)})
             emit_event_span(
                 provider,
                 parent_span,
@@ -94,8 +112,9 @@ class RepeatedToolCallGuard(AgentContextProcessor):
                     "count": count,
                     "scope": self.scope,
                     "announce": self.announce,
+                    "announced_now": announced_now,
                     "iteration": getattr(context, "iteration", None),
                 },
             )
             logger.info("RepeatedToolCallGuard dropping tool '%s' after %d repeats", name, count)
-        return drop
+        return PrepareToolsResult(drop=drop, inject_messages=inject_messages)

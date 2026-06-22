@@ -248,14 +248,19 @@ class BaseAgent(AgentRegistryMixin):
         if self._context_chain:
             from sgr_agent_core.observability import get_provider
 
-            drop = await self._context_chain.run_prepare_tools(
+            result = await self._context_chain.run_prepare_tools(
                 list(self.toolkit),
                 self._context,
                 self.config,
                 provider=get_provider(),
                 parent_span=self._current_iter_span,
             )
-            tools = {t for t in tools if t.tool_name not in drop}
+            tools = {t for t in tools if t.tool_name not in result.drop}
+            # Inject any directives (e.g. "tool X disabled") into the conversation so
+            # they reach this same iteration's selection call — agents prepare tools
+            # before context, so the snapshot taken next includes these messages.
+            for msg in result.inject_messages:
+                self.conversation.append(msg)
         return [pydantic_function_tool(tool, name=tool.tool_name) for tool in tools]
 
     def _build_gen_input(
