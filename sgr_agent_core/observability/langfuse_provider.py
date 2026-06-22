@@ -242,9 +242,13 @@ class LangfuseProvider(ObservabilityProvider):
     ) -> None:
         try:
             if isinstance(handle, LangfuseGenerationHandle) and handle.generation is not None:
+                # The SDK's typed usage only knows input/output/total; a richer breakdown
+                # (e.g. reasoning/cached tokens from _extract_usage) is carried in the
+                # generation metadata instead, so filter to the SDK-known subset here.
+                safe_usage = {k: v for k, v in usage.items() if k in ("input", "output", "total")} if usage else usage
                 handle.generation.end(
                     output=output,
-                    usage=usage,
+                    usage=safe_usage,
                     level=level,
                     status_message=status,
                 )

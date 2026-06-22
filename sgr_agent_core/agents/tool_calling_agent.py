@@ -44,6 +44,10 @@ class ToolCallingAgent(BaseAgent):
         # directives into the conversation, which _prepare_context must then snapshot.
         tool_defs = await self._prepare_tools()
         messages = await self._prepare_context()
+        # Accumulate the model's reasoning/CoT deltas as they stream (separate from the
+        # client stream, which is unchanged). Some providers only attach reasoning to the
+        # final assembled message, so we fall back to that below.
+        reasoning_parts: list[str] = []
         async with self.openai_client.chat.completions.stream(
             messages=messages,
             tools=tool_defs,
@@ -53,22 +57,38 @@ class ToolCallingAgent(BaseAgent):
             async for event in stream:
                 if event.type == "chunk":
                     self.streaming_generator.add_chunk(event.chunk, phase_id)
+                    delta = event.chunk.choices[0].delta if event.chunk.choices else None
+                    rc = self._extract_reasoning(delta)
+                    if rc:
+                        reasoning_parts.append(rc)
             completion = await stream.get_final_completion()
-        # Populate LLM call info for observability generation spans
         usage = completion.usage
         response_msg = completion.choices[0].message
-        self._last_llm_call = {
-            "name": "action-selection",
-            "model": self.config.llm.model,
-            "model_parameters": {"temperature": self.config.llm.temperature, "max_tokens": self.config.llm.max_tokens},
-            "usage": {"input": usage.prompt_tokens, "output": usage.completion_tokens} if usage else None,
-            "input": self._build_gen_input(messages, tool_defs),
-            "output": self._truncate(response_msg.content or str(response_msg.tool_calls)),
-        }
+        reasoning_text = "".join(reasoning_parts) or self._extract_reasoning(response_msg)
+
         tool = completion.choices[0].message.tool_calls[0].function.parsed_arguments
 
         if not isinstance(tool, BaseTool):
             raise ValueError("Selected tool is not a valid BaseTool instance")
+
+        # Populate LLM call info for observability generation spans. Built after the tool
+        # is validated so the traced output always names the actually-selected tool, and
+        # reasoning / visible content / tool call are recorded separately rather than
+        # collapsed (the old `content or tool_calls`, clipped at 2000 chars, hid the CoT).
+        output: dict[str, object] = {
+            "content": self._truncate(response_msg.content),
+            "tool_call": {"name": tool.tool_name, "arguments": self._truncate(tool.model_dump_json())},
+        }
+        if reasoning_text:
+            output["reasoning"] = self._truncate(reasoning_text, self._REASONING_TRACE_MAX_LEN)
+        self._last_llm_call = {
+            "name": "action-selection",
+            "model": self.config.llm.model,
+            "model_parameters": {"temperature": self.config.llm.temperature, "max_tokens": self.config.llm.max_tokens},
+            "usage": self._extract_usage(usage),
+            "input": self._build_gen_input(messages, tool_defs),
+            "output": output,
+        }
         self.conversation.append(
             {
                 "role": "assistant",

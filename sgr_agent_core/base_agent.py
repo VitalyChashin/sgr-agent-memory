@@ -51,6 +51,12 @@ class BaseAgent(AgentRegistryMixin):
     # (see _build_gen_input) to keep Langfuse traces from bloating.
     _MAX_TRACED_TOOL_DEFS: int = 40
 
+    # Cap for the reasoning/CoT text copied into action-selection generation traces.
+    # Larger than the default _truncate cap (this is the diagnostic field) but bounded
+    # so a long internal CoT can't bloat the trace. The raw text never leaves the
+    # client stream — only this truncated copy reaches the observability provider.
+    _REASONING_TRACE_MAX_LEN: int = 8000
+
     def __init__(
         self,
         task_messages: list[ChatCompletionMessageParam],
@@ -93,6 +99,51 @@ class BaseAgent(AgentRegistryMixin):
             return ""
         s = str(value) if not isinstance(value, str) else value
         return s[:max_len] if len(s) > max_len else s
+
+    @staticmethod
+    def _extract_reasoning(obj: Any) -> str | None:
+        """Pull reasoning text from a message or a stream delta, defensively.
+
+        Providers differ: OpenAI omits raw reasoning text (only token counts);
+        DeepSeek-style providers expose ``reasoning_content``; some use ``reasoning``.
+        These are non-standard fields, so on the OpenAI SDK they arrive via the
+        pydantic model's ``model_extra`` rather than as typed attributes. Returns
+        ``None`` when nothing is present and never raises — tracing is fail-silent.
+        """
+        if obj is None:
+            return None
+        for attr in ("reasoning_content", "reasoning"):
+            val = getattr(obj, attr, None)
+            if val is None:
+                extra = getattr(obj, "model_extra", None)
+                if extra:
+                    val = extra.get(attr)
+            if val:
+                return str(val)
+        return None
+
+    @staticmethod
+    def _extract_usage(usage: Any) -> dict[str, Any] | None:
+        """Flat input/output plus a best-effort token breakdown. Never raises.
+
+        Keeps ``input``/``output`` (TokenEfficiencyProcessor depends on them) and
+        adds ``total``, ``reasoning``, and ``cached`` when the provider returns the
+        detail objects. Missing details are simply omitted.
+        """
+        if usage is None:
+            return None
+        out: dict[str, Any] = {
+            "input": getattr(usage, "prompt_tokens", None),
+            "output": getattr(usage, "completion_tokens", None),
+            "total": getattr(usage, "total_tokens", None),
+        }
+        ctd = getattr(usage, "completion_tokens_details", None)
+        if ctd is not None:
+            out["reasoning"] = getattr(ctd, "reasoning_tokens", None)
+        ptd = getattr(usage, "prompt_tokens_details", None)
+        if ptd is not None:
+            out["cached"] = getattr(ptd, "cached_tokens", None)
+        return {k: v for k, v in out.items() if v is not None}
 
     def _flush_provider_async(self, provider: Any) -> None:
         """Fire-and-forget flush of the observability provider in a thread executor."""
@@ -375,12 +426,22 @@ class BaseAgent(AgentRegistryMixin):
         if self._last_llm_call is not None:
             llm_info = self._last_llm_call
             self._last_llm_call = None
+            # Surface the reasoning-token count in metadata so token-heavy
+            # action-selection spikes are filterable in the Langfuse UI even when
+            # the SDK's typed usage only carries flat input/output.
+            action_meta: dict[str, Any] = {
+                "langgraph_node": "action-selection",
+                "langgraph_step": graph_step_base + 2,
+            }
+            reasoning_tokens = (llm_info.get("usage") or {}).get("reasoning")
+            if reasoning_tokens is not None:
+                action_meta["reasoning_tokens"] = reasoning_tokens
             gen = provider.start_generation(
                 name=llm_info.get("name", "action-selection"),
                 model=llm_info.get("model"),
                 model_parameters=llm_info.get("model_parameters"),
                 input=llm_info.get("input"),
-                metadata={"langgraph_node": "action-selection", "langgraph_step": graph_step_base + 2},
+                metadata=action_meta,
                 _parent=iter_span,
             )
             provider.end_generation(gen, output=llm_info.get("output"), usage=llm_info.get("usage"))
