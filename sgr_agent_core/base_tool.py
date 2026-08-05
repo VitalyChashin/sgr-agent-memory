@@ -5,7 +5,7 @@ import logging
 from typing import TYPE_CHECKING, Any, ClassVar, Self, TypeVar
 
 from fastmcp import Client
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from sgr_agent_core.agent_config import GlobalConfig
 from sgr_agent_core.observability.context import mcp_call_errored
@@ -38,6 +38,16 @@ class BaseTool(BaseModel, ToolRegistryMixin):
     # Optional: Pydantic model for tool config; agent.get_tool_config(tool_class) returns an instance of it
     config_model: ClassVar[ToolConfig] = None
 
+    # Elicits chain-of-thought from models that have no native reasoning channel (or
+    # whose reasoning is stripped in transit — see notes/tool-argument-reasoning.md).
+    # Declared on the base so it is first in every tool's schema: the model writes its
+    # thinking before the arguments it justifies. Subclasses may override the
+    # description; MCP payloads drop it (it is not a real server argument).
+    reasoning: str = Field(
+        default="",
+        description="Brief step-by-step thinking that justifies calling this tool with these arguments",
+    )
+
     async def __call__(self, context: AgentContext, config: AgentConfig, **kwargs) -> str:
         """The result should be a string or dumped JSON."""
         raise NotImplementedError("Execute method must be implemented by subclass")
@@ -66,13 +76,18 @@ class MCPBaseTool(BaseTool):
     _client: ClassVar[Client | None] = None
     _processor_chain: ClassVar[Any] = None  # MCPPayloadProcessorChain | None
     _managed_fields: ClassVar[list[str]] = []
+    # True when the server's own input schema has a `reasoning` parameter, in which
+    # case it is a real argument and must NOT be stripped from the payload.
+    _declares_reasoning: ClassVar[bool] = False
 
     async def __call__(self, context: AgentContext, config: AgentConfig, **kwargs) -> str:
         from sgr_agent_core.observability import get_provider
         from sgr_agent_core.observability.context import current_tool_span
 
         global_config = GlobalConfig()
-        payload = self.model_dump(mode="json")
+        # BaseTool.reasoning is a prompting device, not an MCP argument — the server
+        # would reject it as unexpected input, so it never leaves the process.
+        payload = self.model_dump(mode="json", exclude=None if self._declares_reasoning else {"reasoning"})
 
         # Provider + active tool span (set by BaseAgent) so payload-processor spans
         # nest under the MCP call they wrap. Both safe/no-op when unset.

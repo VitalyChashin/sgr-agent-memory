@@ -118,6 +118,7 @@ class MCP2ToolConverter:
                     ToolCls._client = client
                     ToolCls._processor_chain = processor_chain
                     ToolCls._managed_fields = managed_fields
+                    ToolCls._declares_reasoning = "reasoning" in (t.inputSchema.get("properties") or {})
 
                     # Override model_json_schema to hide managed fields from LLM
                     if managed_fields:

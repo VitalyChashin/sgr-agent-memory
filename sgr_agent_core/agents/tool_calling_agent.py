@@ -71,6 +71,11 @@ class ToolCallingAgent(BaseAgent):
         if not isinstance(tool, BaseTool):
             raise ValueError("Selected tool is not a valid BaseTool instance")
 
+        # Providers without a reasoning channel (or behind a gateway that drops it)
+        # leave reasoning_text empty; the tool's own `reasoning` argument carries the
+        # CoT instead, so the trace shows one reasoning field either way.
+        reasoning_text = reasoning_text or tool.reasoning or None
+
         # Populate LLM call info for observability generation spans. Built after the tool
         # is validated so the traced output always names the actually-selected tool, and
         # reasoning / visible content / tool call are recorded separately rather than
