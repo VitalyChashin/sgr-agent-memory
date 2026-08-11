@@ -293,7 +293,12 @@ class BaseAgent(AgentRegistryMixin):
         Returns a list of ChatCompletionFunctionToolParam based
         available tools.
         """
-        tools = set(self.toolkit)
+        # Ordered, deduped — NOT a set. Tool order is part of the provider's prefix-cache
+        # key, so a hash-ordered toolkit gives a different prefix per process (and
+        # reshuffles survivors after a drop). Measured on gpt-4.1-mini: a fresh ordering
+        # costs ~1.3k re-processed tokens on the first call of each worker.
+        # See research/prefix-caching-tool-calling-agent.md §9.
+        tools = list(dict.fromkeys(self.toolkit))
         if self._context.iteration >= self.config.execution.max_iterations:
             raise RuntimeError("Max iterations reached")
         if self._context_chain:
@@ -306,7 +311,7 @@ class BaseAgent(AgentRegistryMixin):
                 provider=get_provider(),
                 parent_span=self._current_iter_span,
             )
-            tools = {t for t in tools if t.tool_name not in result.drop}
+            tools = [t for t in tools if t.tool_name not in result.drop]
             # Inject any directives (e.g. "tool X disabled") into the conversation so
             # they reach this same iteration's selection call — agents prepare tools
             # before context, so the snapshot taken next includes these messages.
@@ -620,7 +625,11 @@ class BaseAgent(AgentRegistryMixin):
 
         self.logger.info(f"🚀 User provided {len(self.task_messages)} messages.")
         init_message = f"Agent {self.id} started\n"
-        self.conversation.append({"role": "system", "content": init_message})
+        # `assistant`, not `system`: this lands mid-list (after task_messages and the
+        # initial user request), and strict chat templates reject a system message that
+        # is not first — NeuralDeep's qwen3.6-35b-a3b upstream 400s with
+        # "System message must be at the beginning."
+        self.conversation.append({"role": "assistant", "content": init_message})
         self.streaming_generator.add_content_delta(init_message, "0-start")
 
         # Rolling memory — compact context before reasoning loop

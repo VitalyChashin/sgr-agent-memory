@@ -403,6 +403,31 @@ class TestBaseAgentAbstractMethods:
         assert len(tools) == 0
 
     @pytest.mark.asyncio
+    async def test_prepare_tools_preserves_toolkit_order(self):
+        """Tool defs follow toolkit order, before and after a drop.
+
+        Tool order is part of the provider's prefix-cache key, so hash-based ordering
+        (a `set`) would give a different prefix per process and reshuffle survivors
+        after a drop. See research/prefix-caching-tool-calling-agent.md.
+        """
+        from unittest.mock import AsyncMock
+
+        from sgr_agent_core.context_processors.base import PrepareToolsResult
+        from sgr_agent_core.tools import ClarificationTool, FinalAnswerTool
+
+        toolkit = [WebSearchTool, ReasoningTool, ClarificationTool, FinalAnswerTool]
+        agent = create_test_agent(BaseAgent, toolkit=toolkit)
+
+        names = [t["function"]["name"] for t in await agent._prepare_tools()]
+        assert names == [t.tool_name for t in toolkit]
+
+        agent._context_chain = Mock(
+            run_prepare_tools=AsyncMock(return_value=PrepareToolsResult(drop={ReasoningTool.tool_name}))
+        )
+        names = [t["function"]["name"] for t in await agent._prepare_tools()]
+        assert names == [t.tool_name for t in toolkit if t is not ReasoningTool]
+
+    @pytest.mark.asyncio
     async def test_reasoning_phase_raises_not_implemented(self):
         """Test that _reasoning_phase raises NotImplementedError."""
         agent = create_test_agent(BaseAgent, task_messages=[{"role": "user", "content": "Test"}])
@@ -523,9 +548,12 @@ class TestBaseAgentCancellation:
         await asyncio.sleep(0.05)
 
         expected = f"Agent {agent_id} started\n"
+        # Role must NOT be "system": the message lands mid-conversation and strict
+        # chat templates reject a non-leading system message.
         assert any(
-            m.get("content") == expected for m in agent.conversation if m.get("role") == "system"
-        ), "Conversation should contain agent started system message"
+            m.get("content") == expected for m in agent.conversation if m.get("role") == "assistant"
+        ), "Conversation should contain agent started message as an assistant turn"
+        assert not any(m.get("role") == "system" for m in agent.conversation)
         # SSE chunks are JSON-serialized, so the newline appears as \\n in the raw string
         assert any(
             f"Agent {agent_id} started" in chunk for chunk in streamed
