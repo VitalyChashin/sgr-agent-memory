@@ -94,6 +94,72 @@ class TestMCPPayloadProcessorChain:
             await chain.run_pre_call({}, mock_context, mock_config)
 
 
+class _RecordingProvider:
+    """Records start_span/end_span so tests can assert MCP processor wrapping spans."""
+
+    def __init__(self):
+        self.started = []
+        self.ended = []
+
+    def start_span(self, *, name, span_type="span", input=None, metadata=None, _parent=None):
+        handle = {"name": name, "parent": _parent}
+        self.started.append(handle)
+        return handle
+
+    def end_span(self, handle, *, output=None, status=None, level="DEFAULT"):
+        self.ended.append({"name": handle["name"], "output": output, "level": level})
+
+
+class TestMCPProcessorSpans:
+    """Deliverable C — span_mode wrapping of MCP payload-processor invocations."""
+
+    @pytest.mark.asyncio
+    async def test_default_off_emits_no_spans(self, mock_context, mock_config):
+        provider = _RecordingProvider()
+        chain = MCPPayloadProcessorChain([AddFieldProcessor()])  # default span_mode "off"
+        await chain.run_pre_call({}, mock_context, mock_config, provider=provider, parent_span="TOOLSPAN")
+        assert provider.started == []
+
+    @pytest.mark.asyncio
+    async def test_always_wraps_pre_and_post(self, mock_context, mock_config):
+        provider = _RecordingProvider()
+        p = UpperCaseProcessor()
+        p._span_mode = "always"
+        chain = MCPPayloadProcessorChain([p])
+
+        await chain.run_pre_call({"query": "hi"}, mock_context, mock_config, provider=provider, parent_span="TOOLSPAN")
+        await chain.run_post_call("hi", {}, mock_context, mock_config, provider=provider, parent_span="TOOLSPAN")
+
+        assert [s["name"] for s in provider.started] == [
+            "mcp-processor.UpperCaseProcessor.pre_call",
+            "mcp-processor.UpperCaseProcessor.post_call",
+        ]
+        # Spans nest under the tool span passed by BaseAgent.
+        assert provider.started[0]["parent"] == "TOOLSPAN"
+        assert all(e["level"] == "DEFAULT" for e in provider.ended)
+
+    @pytest.mark.asyncio
+    async def test_error_span_is_error_level_and_reraises(self, mock_context, mock_config):
+        provider = _RecordingProvider()
+        p = ErrorProcessor()
+        p._span_mode = "always"
+        chain = MCPPayloadProcessorChain([p])
+
+        with pytest.raises(ValueError, match="pre_call error"):
+            await chain.run_pre_call({}, mock_context, mock_config, provider=provider, parent_span="TOOLSPAN")
+        assert provider.ended[0]["level"] == "ERROR"
+        assert "error" in provider.ended[0]["output"]
+
+    @pytest.mark.asyncio
+    async def test_no_provider_is_safe(self, mock_context, mock_config):
+        p = UpperCaseProcessor()
+        p._span_mode = "always"
+        chain = MCPPayloadProcessorChain([p])
+        # provider=None (default) — wrapping is a no-op, transform still happens.
+        result = await chain.run_pre_call({"query": "hi"}, mock_context, mock_config)
+        assert result["query"] == "HI"
+
+
 class TestProcessorRegistry:
     """Tests for processor auto-registration."""
 
@@ -129,3 +195,8 @@ class TestPayloadProcessorDefinition:
         assert defn.class_name == "MyProcessor"
         assert defn.config == {}
         assert defn.managed_fields == []
+        assert defn.span_mode == "off"
+
+    def test_span_mode_explicit(self):
+        defn = PayloadProcessorDefinition.model_validate({"class": "MyProcessor", "span_mode": "always"})
+        assert defn.span_mode == "always"

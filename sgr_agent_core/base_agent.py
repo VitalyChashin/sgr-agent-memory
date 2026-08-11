@@ -13,6 +13,7 @@ from pydantic import BaseModel
 
 from sgr_agent_core.agent_definition import AgentConfig, ToolDefinition
 from sgr_agent_core.models import AgentContext, AgentStatesEnum
+from sgr_agent_core.observability.context import current_tool_span, mcp_call_errored
 from sgr_agent_core.services.prompt_loader import PromptLoader
 from sgr_agent_core.services.registry import AgentRegistry
 from sgr_agent_core.stream import BaseStreamingGenerator, OpenAIStreamingGenerator
@@ -21,6 +22,17 @@ from sgr_agent_core.tools import (
     ClarificationTool,
     ReasoningTool,
 )
+
+
+def _classify_error_tags(exc: BaseException) -> set[str]:
+    """Map a fatal loop exception to Langfuse-filterable error tags.
+
+    ``RuntimeError("Max iterations reached")`` is the max-steps crash; everything
+    else that bubbles to the loop's handler is an LLM/tool failure.
+    """
+    if isinstance(exc, RuntimeError) and str(exc).startswith("Max iterations reached"):
+        return {"error", "error:max_steps"}
+    return {"error", "error:llm"}
 
 
 class AgentRegistryMixin:
@@ -34,6 +46,16 @@ class BaseAgent(AgentRegistryMixin):
     """Base class for agents."""
 
     name: str = "base_agent"
+
+    # Above this many tool defs, traced input degrades to compact name+description
+    # (see _build_gen_input) to keep Langfuse traces from bloating.
+    _MAX_TRACED_TOOL_DEFS: int = 40
+
+    # Cap for the reasoning/CoT text copied into action-selection generation traces.
+    # Larger than the default _truncate cap (this is the diagnostic field) but bounded
+    # so a long internal CoT can't bloat the trace. The raw text never leaves the
+    # client stream — only this truncated copy reaches the observability provider.
+    _REASONING_TRACE_MAX_LEN: int = 8000
 
     def __init__(
         self,
@@ -64,6 +86,12 @@ class BaseAgent(AgentRegistryMixin):
         self._execute_task: asyncio.Task | None = None
         self._last_llm_call: dict | None = None
 
+        # Agent Context Processor chain (built per run in _execute; None = zero-cost path).
+        # _current_iter_span lets _prepare_tools (deeper in the call stack, without iter_span
+        # in scope) parent any emitted span under the active iteration.
+        self._context_chain: Any = None
+        self._current_iter_span: Any = None
+
     @staticmethod
     def _truncate(value: Any, max_len: int = 2000) -> str:
         """Safely truncate any value to a string with max length."""
@@ -71,6 +99,51 @@ class BaseAgent(AgentRegistryMixin):
             return ""
         s = str(value) if not isinstance(value, str) else value
         return s[:max_len] if len(s) > max_len else s
+
+    @staticmethod
+    def _extract_reasoning(obj: Any) -> str | None:
+        """Pull reasoning text from a message or a stream delta, defensively.
+
+        Providers differ: OpenAI omits raw reasoning text (only token counts);
+        DeepSeek-style providers expose ``reasoning_content``; some use ``reasoning``.
+        These are non-standard fields, so on the OpenAI SDK they arrive via the
+        pydantic model's ``model_extra`` rather than as typed attributes. Returns
+        ``None`` when nothing is present and never raises — tracing is fail-silent.
+        """
+        if obj is None:
+            return None
+        for attr in ("reasoning_content", "reasoning"):
+            val = getattr(obj, attr, None)
+            if val is None:
+                extra = getattr(obj, "model_extra", None)
+                if extra:
+                    val = extra.get(attr)
+            if val:
+                return str(val)
+        return None
+
+    @staticmethod
+    def _extract_usage(usage: Any) -> dict[str, Any] | None:
+        """Flat input/output plus a best-effort token breakdown. Never raises.
+
+        Keeps ``input``/``output`` (TokenEfficiencyProcessor depends on them) and
+        adds ``total``, ``reasoning``, and ``cached`` when the provider returns the
+        detail objects. Missing details are simply omitted.
+        """
+        if usage is None:
+            return None
+        out: dict[str, Any] = {
+            "input": getattr(usage, "prompt_tokens", None),
+            "output": getattr(usage, "completion_tokens", None),
+            "total": getattr(usage, "total_tokens", None),
+        }
+        ctd = getattr(usage, "completion_tokens_details", None)
+        if ctd is not None:
+            out["reasoning"] = getattr(ctd, "reasoning_tokens", None)
+        ptd = getattr(usage, "prompt_tokens_details", None)
+        if ptd is not None:
+            out["cached"] = getattr(ptd, "cached_tokens", None)
+        return {k: v for k, v in out.items() if v is not None}
 
     def _flush_provider_async(self, provider: Any) -> None:
         """Fire-and-forget flush of the observability provider in a thread executor."""
@@ -220,10 +293,74 @@ class BaseAgent(AgentRegistryMixin):
         Returns a list of ChatCompletionFunctionToolParam based
         available tools.
         """
-        tools = set(self.toolkit)
+        # Ordered, deduped — NOT a set. Tool order is part of the provider's prefix-cache
+        # key, so a hash-ordered toolkit gives a different prefix per process (and
+        # reshuffles survivors after a drop). Measured on gpt-4.1-mini: a fresh ordering
+        # costs ~1.3k re-processed tokens on the first call of each worker.
+        # See research/prefix-caching-tool-calling-agent.md §9.
+        tools = list(dict.fromkeys(self.toolkit))
         if self._context.iteration >= self.config.execution.max_iterations:
             raise RuntimeError("Max iterations reached")
+        if self._context_chain:
+            from sgr_agent_core.observability import get_provider
+
+            result = await self._context_chain.run_prepare_tools(
+                list(self.toolkit),
+                self._context,
+                self.config,
+                provider=get_provider(),
+                parent_span=self._current_iter_span,
+            )
+            tools = [t for t in tools if t.tool_name not in result.drop]
+            # Inject any directives (e.g. "tool X disabled") into the conversation so
+            # they reach this same iteration's selection call — agents prepare tools
+            # before context, so the snapshot taken next includes these messages.
+            for msg in result.inject_messages:
+                self.conversation.append(msg)
         return [pydantic_function_tool(tool, name=tool.tool_name) for tool in tools]
+
+    def _build_gen_input(
+        self,
+        messages: list,
+        tool_defs: list[ChatCompletionFunctionToolParam] | None,
+        tool_choice: Any = None,
+    ) -> Any:
+        """Shape the generation ``input`` so Langfuse renders an Available-tools section.
+
+        Returns the OpenAI-request object ``{messages, tools, tool_choice}`` when
+        tool capture is enabled and tools exist; otherwise the bare ``messages``
+        list (unchanged behaviour, e.g. NoOp / structured-output paths).
+
+        The tool defs are kept in the full ``{"type": "function", "function": {...}}``
+        shape — that is what Langfuse's tool renderer keys on — except when the
+        toolset is large enough to bloat the trace, in which case they degrade to
+        a compact ``[{name, description}]`` list flagged with ``_tools_truncated``.
+        """
+        from sgr_agent_core.agent_config import GlobalConfig
+
+        if not tool_defs or not GlobalConfig().observability.capture_tool_definitions:
+            return messages
+
+        payload: dict[str, Any] = {"messages": messages}
+        # Degrade gracefully for pathologically large toolsets: keep names +
+        # descriptions but drop the full schemas, and flag it so the capping is
+        # visible in the trace rather than silent.
+        if len(tool_defs) > self._MAX_TRACED_TOOL_DEFS:
+            payload["tools"] = [
+                {
+                    "name": (fn := td.get("function", td)).get("name"),
+                    "description": fn.get("description", ""),
+                }
+                for td in tool_defs
+            ]
+            payload["_tools_truncated"] = True
+        else:
+            payload["tools"] = tool_defs
+
+        tc = tool_choice if tool_choice is not None else getattr(self, "tool_choice", None)
+        if tc is not None:
+            payload["tool_choice"] = tc
+        return payload
 
     async def _reasoning_phase(self) -> ReasoningTool:
         """Call LLM to decide next action based on current context."""
@@ -294,12 +431,22 @@ class BaseAgent(AgentRegistryMixin):
         if self._last_llm_call is not None:
             llm_info = self._last_llm_call
             self._last_llm_call = None
+            # Surface the reasoning-token count in metadata so token-heavy
+            # action-selection spikes are filterable in the Langfuse UI even when
+            # the SDK's typed usage only carries flat input/output.
+            action_meta: dict[str, Any] = {
+                "langgraph_node": "action-selection",
+                "langgraph_step": graph_step_base + 2,
+            }
+            reasoning_tokens = (llm_info.get("usage") or {}).get("reasoning")
+            if reasoning_tokens is not None:
+                action_meta["reasoning_tokens"] = reasoning_tokens
             gen = provider.start_generation(
                 name=llm_info.get("name", "action-selection"),
                 model=llm_info.get("model"),
                 model_parameters=llm_info.get("model_parameters"),
                 input=llm_info.get("input"),
-                metadata={"langgraph_node": "action-selection", "langgraph_step": graph_step_base + 2},
+                metadata=action_meta,
                 _parent=iter_span,
             )
             provider.end_generation(gen, output=llm_info.get("output"), usage=llm_info.get("usage"))
@@ -328,10 +475,22 @@ class BaseAgent(AgentRegistryMixin):
             _parent=iter_span,
         )
         try:
-            tool_result = await self._action_phase(action_tool)
+            # Expose the tool span so MCP payload-processor spans (inside the tool's
+            # __call__) can nest under it. Reset exactly once, success or error.
+            _span_token = current_tool_span.set(tool_span)
+            try:
+                tool_result = await self._action_phase(action_tool)
+            finally:
+                current_tool_span.reset(_span_token)
+            # An MCP tool error is swallowed into the result string (the loop continues),
+            # but the tool layer flags it so we still mark the span ERROR for filtering.
+            mcp_errored = mcp_call_errored.get()
+            mcp_call_errored.set(False)
             provider.end_span(
                 tool_span,
                 output={"result": self._truncate(tool_result)},
+                level="ERROR" if mcp_errored else "DEFAULT",
+                status="MCP tool returned an error" if mcp_errored else None,
             )
             if metrics_chain:
                 await metrics_chain.run_hook(
@@ -343,6 +502,15 @@ class BaseAgent(AgentRegistryMixin):
                     config=self.config,
                     provider=provider,
                     trace_handle=trace,
+                )
+            if self._context_chain:
+                await self._context_chain.run_on_tool_end(
+                    action_tool,
+                    tool_result,
+                    self._context,
+                    self.config,
+                    provider=provider,
+                    parent_span=tool_span,
                 )
         except Exception as tool_err:
             provider.end_span(
@@ -440,6 +608,12 @@ class BaseAgent(AgentRegistryMixin):
         from sgr_agent_core.observability.metrics import build_metrics_chain
 
         metrics_chain = build_metrics_chain(_GlobalConfig._instance or _GlobalConfig())
+
+        # Build per-agent context processor chain (None if none configured = zero overhead).
+        from sgr_agent_core.context_processors import build_context_processor_chain
+
+        self._context_chain = build_context_processor_chain(self.config)
+
         if metrics_chain:
             await metrics_chain.run_hook(
                 "on_trace_start",
@@ -451,7 +625,11 @@ class BaseAgent(AgentRegistryMixin):
 
         self.logger.info(f"🚀 User provided {len(self.task_messages)} messages.")
         init_message = f"Agent {self.id} started\n"
-        self.conversation.append({"role": "system", "content": init_message})
+        # `assistant`, not `system`: this lands mid-list (after task_messages and the
+        # initial user request), and strict chat templates reject a system message that
+        # is not first — NeuralDeep's qwen3.6-35b-a3b upstream 400s with
+        # "System message must be at the beginning."
+        self.conversation.append({"role": "assistant", "content": init_message})
         self.streaming_generator.add_content_delta(init_message, "0-start")
 
         # Rolling memory — compact context before reasoning loop
@@ -512,9 +690,25 @@ class BaseAgent(AgentRegistryMixin):
                     metadata={"searches_used": self._context.searches_used},
                     _parent=trace,
                 )
+                # Expose the active iteration span so _prepare_tools (deeper in the
+                # call stack) can parent any context-processor span under it.
+                self._current_iter_span = iter_span
 
                 try:
                     await self._execution_step(iter_span=iter_span, metrics_chain=metrics_chain, trace=trace)
+
+                    # Agent Context Processor: before-finish seam. Runs right after a terminal
+                    # tool drove a finish state, before the loop re-checks. A veto resets the
+                    # state to a non-finish resume state and injects corrective messages.
+                    if self._context_chain and self._context.state in AgentStatesEnum.FINISH_STATES.value:
+                        decision = await self._context_chain.run_before_finish(
+                            self._context, self.config, provider=provider, parent_span=iter_span
+                        )
+                        if decision.force_continue:
+                            for m in decision.inject_messages:
+                                self.conversation.append(m)
+                            self._context.state = AgentStatesEnum.RESEARCHING
+
                     # Build iteration output with reasoning data if available
                     iter_output: dict[str, Any] = {"state_after": self._context.state.value}
                     reasoning = self._context.current_step_reasoning
@@ -586,6 +780,9 @@ class BaseAgent(AgentRegistryMixin):
                 trace,
                 output=trace_output,
                 status=final_status,
+                # Merge any swallowed-error tags (e.g. an MCP 500) so a run that ends
+                # "completed" is still filterable as error:mcp_tool.
+                tags=trace_tags + sorted(self._context.error_tags),
             )
             self._flush_provider_async(provider)
             return self._context.execution_result
@@ -600,7 +797,13 @@ class BaseAgent(AgentRegistryMixin):
         except Exception as e:
             self.logger.error(f"❌ Agent execution error: {str(e)}")
             self._context.state = AgentStatesEnum.FAILED
-            provider.end_trace(trace, output={"error": str(e)}, status=f"failed: {e}")
+            err_tags = self._context.error_tags | _classify_error_tags(e)
+            provider.end_trace(
+                trace,
+                output={"error": str(e)},
+                status=f"failed: {e}",
+                tags=trace_tags + sorted(err_tags),
+            )
             self._flush_provider_async(provider)
             traceback.print_exc()
         finally:

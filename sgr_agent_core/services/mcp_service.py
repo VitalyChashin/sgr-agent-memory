@@ -7,6 +7,8 @@ from fastmcp.mcp_config import MCPConfig
 from jambo import SchemaConverter
 from pydantic import create_model
 
+from sgr_agent_core.services.retry import RetryPolicy, with_mcp_retry
+
 logger = logging.getLogger(__name__)
 
 
@@ -53,7 +55,9 @@ class MCP2ToolConverter:
                         f"Processor '{defn.class_name}' not found in registry and cannot be imported: {e}"
                     ) from e
 
-            processors.append(processor_cls(defn.config))
+            proc = processor_cls(defn.config)
+            proc._span_mode = defn.span_mode
+            processors.append(proc)
 
         chain = MCPPayloadProcessorChain(processors) if processors else None
         return chain, all_managed_fields
@@ -61,6 +65,7 @@ class MCP2ToolConverter:
     @classmethod
     async def build_tools_from_mcp(cls, config: MCPConfig):
         from sgr_agent_core import BaseTool, MCPBaseTool
+        from sgr_agent_core.agent_config import GlobalConfig
 
         tools = []
         if not config.mcpServers:
@@ -75,65 +80,88 @@ class MCP2ToolConverter:
                 elif isinstance(server_cfg, dict):
                     server_processor_configs[server_name] = server_cfg.get("payload_processors", [])
 
-        client: Client = Client(config)
-        async with client:
-            mcp_tools = await client.list_tools()
+        async def _connect_and_build() -> list:
+            built: list = []
+            client: Client = Client(config)
+            async with client:
+                mcp_tools = await client.list_tools()
 
-            # Merge processor defs from all servers, deduplicating by class name
-            seen_classes: set[str] = set()
-            unique_processor_defs: list[dict] = []
-            for defs in server_processor_configs.values():
-                for d in defs:
-                    cls_name = d.get("class", "")
-                    if cls_name not in seen_classes:
-                        seen_classes.add(cls_name)
-                        unique_processor_defs.append(d)
+                # Merge processor defs from all servers, deduplicating by class name
+                seen_classes: set[str] = set()
+                unique_processor_defs: list[dict] = []
+                for defs in server_processor_configs.values():
+                    for d in defs:
+                        cls_name = d.get("class", "")
+                        if cls_name not in seen_classes:
+                            seen_classes.add(cls_name)
+                            unique_processor_defs.append(d)
 
-            processor_chain, managed_fields = cls._build_processor_chain(unique_processor_defs)
+                processor_chain, managed_fields = cls._build_processor_chain(unique_processor_defs)
 
-            for t in mcp_tools:
-                if not t.name or not t.inputSchema:
-                    logger.error(f"Skipping tool due to missing name or input schema: {t}")
-                    continue
+                for t in mcp_tools:
+                    if not t.name or not t.inputSchema:
+                        logger.error(f"Skipping tool due to missing name or input schema: {t}")
+                        continue
 
-                try:
-                    t.inputSchema["title"] = cls._to_CamelCase(t.name)
-                    PdModel = SchemaConverter.build(t.inputSchema)
-                except Exception as e:
-                    logger.error(f"Error creating model {t.name} from schema: {t.inputSchema}: {e}")
-                    continue
+                    try:
+                        t.inputSchema["title"] = cls._to_CamelCase(t.name)
+                        PdModel = SchemaConverter.build(t.inputSchema)
+                    except Exception as e:
+                        logger.error(f"Error creating model {t.name} from schema: {t.inputSchema}: {e}")
+                        continue
 
-                ToolCls: Type[BaseTool] = create_model(
-                    f"MCP{cls._to_CamelCase(t.name)}", __base__=(PdModel, MCPBaseTool), __doc__=t.description or ""
+                    ToolCls: Type[BaseTool] = create_model(
+                        f"MCP{cls._to_CamelCase(t.name)}", __base__=(PdModel, MCPBaseTool), __doc__=t.description or ""
+                    )
+                    ToolCls.tool_name = t.name
+                    ToolCls.description = t.description or ""
+                    ToolCls._client = client
+                    ToolCls._processor_chain = processor_chain
+                    ToolCls._managed_fields = managed_fields
+                    ToolCls._declares_reasoning = "reasoning" in (t.inputSchema.get("properties") or {})
+
+                    # Override model_json_schema to hide managed fields from LLM
+                    if managed_fields:
+                        import copy
+
+                        _fields_to_hide = list(managed_fields)
+                        original_schema = ToolCls.model_json_schema
+
+                        @classmethod  # type: ignore[misc]
+                        def _filtered_schema(cls, *args: Any, **kwargs: Any) -> dict:
+                            schema = copy.deepcopy(original_schema(*args, **kwargs))
+                            props = schema.get("properties", {})
+                            required = schema.get("required", [])
+                            for field_name in _fields_to_hide:
+                                props.pop(field_name, None)
+                                if field_name in required:
+                                    required.remove(field_name)
+                            return schema
+
+                        ToolCls.model_json_schema = _filtered_schema  # type: ignore[assignment]
+
+                    built.append(ToolCls)
+                    logger.info(f"Built MCP Tool: {ToolCls.tool_name}")
+
+                logger.info(f"Built {len(built)} MCP tools.")
+                return built
+
+        retry_cfg = GlobalConfig().execution.mcp_retry
+        policy = RetryPolicy(
+            attempts=retry_cfg.attempts,
+            base_delay=retry_cfg.base_delay,
+            max_delay=retry_cfg.max_delay,
+            backoff_factor=retry_cfg.backoff_factor,
+        )
+        server_names = ",".join(config.mcpServers.keys())
+        try:
+            return await with_mcp_retry(_connect_and_build, policy, what=f"build_tools({server_names})")
+        except Exception:
+            if retry_cfg.degrade_on_build_failure:
+                logger.warning(
+                    "MCP tool build failed after %d attempt(s); continuing without MCP tools",
+                    policy.attempts,
+                    exc_info=True,
                 )
-                ToolCls.tool_name = t.name
-                ToolCls.description = t.description or ""
-                ToolCls._client = client
-                ToolCls._processor_chain = processor_chain
-                ToolCls._managed_fields = managed_fields
-
-                # Override model_json_schema to hide managed fields from LLM
-                if managed_fields:
-                    import copy
-
-                    _fields_to_hide = list(managed_fields)
-                    original_schema = ToolCls.model_json_schema
-
-                    @classmethod  # type: ignore[misc]
-                    def _filtered_schema(cls, *args: Any, **kwargs: Any) -> dict:
-                        schema = copy.deepcopy(original_schema(*args, **kwargs))
-                        props = schema.get("properties", {})
-                        required = schema.get("required", [])
-                        for field_name in _fields_to_hide:
-                            props.pop(field_name, None)
-                            if field_name in required:
-                                required.remove(field_name)
-                        return schema
-
-                    ToolCls.model_json_schema = _filtered_schema  # type: ignore[assignment]
-
-                tools.append(ToolCls)
-                logger.info(f"Built MCP Tool: {ToolCls.tool_name}")
-
-            logger.info(f"Built {len(tools)} MCP tools.")
-            return tools
+                return tools
+            raise

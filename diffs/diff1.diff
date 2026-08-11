@@ -1,0 +1,1331 @@
+ CLAUDE.md                                          |  12 +
+ agents.yaml.example                                |  30 +++
+ plans/agent-context-processors.md                  |   4 +-
+ plans/gaps/agent-context-processors.md             |  49 ++--
+ research/agent-context-processors.md               |   4 +-
+ sgr_agent_core/agent_definition.py                 |   6 +
+ sgr_agent_core/base_agent.py                       |  48 ++++
+ sgr_agent_core/context_processors/__init__.py      |  33 +++
+ sgr_agent_core/context_processors/base.py          | 264 +++++++++++++++++++++
+ .../context_processors/mandatory_tool_call.py      |  94 ++++++++
+ .../context_processors/repeated_tool_call_guard.py | 101 ++++++++
+ tests/context_processors/__init__.py               |   0
+ tests/context_processors/conftest.py               |  69 ++++++
+ tests/context_processors/test_base.py              | 135 +++++++++++
+ tests/context_processors/test_loop_integration.py  | 130 ++++++++++
+ .../context_processors/test_mandatory_tool_call.py |  52 ++++
+ .../test_repeated_tool_call_guard.py               | 112 +++++++++
+ 17 files changed, 1116 insertions(+), 27 deletions(-)
+
+diff --git a/CLAUDE.md b/CLAUDE.md
+index cd63f3e..ff85e46 100644
+--- a/CLAUDE.md
++++ b/CLAUDE.md
+@@ -60,6 +60,18 @@ sgr_agent_core/           # Core Python package
+ 
+ MCP servers are configured in `config.yaml` under `mcp.mcpServers`. MCP tools use `MCPBaseTool` which handles calls through the MCP client and converts them to the framework's tool format. The framework uses `fastmcp` ≥ 2.12.4 for MCP server integration.
+ 
++## Processor Plugins
++
++Three processor-plugin families share one skeleton (auto-registering ABC + `*Definition` + `*Chain` + registry-then-import-string resolution; see `notes/processor-plugin-pattern.md`):
++
++| Family | When it runs | Can mutate? |
++|--------|--------------|-------------|
++| `MCPPayloadProcessor` (`mcp_payload_processor.py`) | per MCP tool call (`pre_call`/`post_call`) | yes |
++| `MetricsProcessor` (`observability/metrics/`) | at loop seams | no (observe only, fail-silent) |
++| `AgentContextProcessor` (`context_processors/`) | at loop seams | yes (read-write) |
++
++**Agent Context Processors** are configured **per-agent** via the `context_processors` list on `AgentConfig` (per-agent value replaces the global default). They run at three seams: `on_prepare_tools` (drop tools before selection), `on_tool_end`, and `on_before_finish` (veto a premature finish + inject messages). Hooks are fail-safe-but-visible (logged at WARNING; failures never loop the agent forever). Each hook is offered the active observability `provider`/`parent_span` for **optional** per-processor span emission (`emit_event_span`, a no-op under `NoOpProvider`). Built-ins: `RepeatedToolCallGuard`, `MandatoryToolCallProcessor`. Config example: `agents.yaml.example`.
++
+ ## Development Commands
+ 
+ ```bash
+diff --git a/agents.yaml.example b/agents.yaml.example
+index 8795f71..b25a9fa 100644
+--- a/agents.yaml.example
++++ b/agents.yaml.example
+@@ -104,6 +104,36 @@ agents:
+       - "clarification_tool"
+       - "final_answer_tool"
+ 
++  # Example 5b: Agents using context processors (read-write at agent-loop seams)
++  # ----------------------------------------------------------------------------
++  # `context_processors` is a per-agent list. Each entry resolves by registry
++  # class name first, then by dotted import string. Built-ins:
++  #   - RepeatedToolCallGuard: drops a tool after it is called `max_repeats`
++  #     times in a run (breaks stuck leaf-agent retry loops).
++  #   - MandatoryToolCallProcessor: vetoes a finish that happens before
++  #     `min_tool_calls` work-tool calls (stops a router "answering itself"),
++  #     up to `max_retries` times.
++  router_agent:
++    base_class: "ToolCallingAgent"
++    tools:
++      - "final_answer_tool"
++    context_processors:
++      - class: "MandatoryToolCallProcessor"
++        config:
++          min_tool_calls: 1
++          max_retries: 2
++
++  db_leaf_agent:
++    base_class: "ToolCallingAgent"
++    tools:
++      - "final_answer_tool"
++    context_processors:
++      - class: "RepeatedToolCallGuard"
++        config:
++          max_repeats: 3
++          scope: "exact_args"   # or "tool_name"
++          failed_only: false    # true = only count results starting with "Error:"
++
+   # Example 5: Agent using inline prompts instead of files
+   inline_prompt_agent:
+     base_class: "SGRAgent"
+diff --git a/plans/agent-context-processors.md b/plans/agent-context-processors.md
+index 2402a5e..447efb4 100644
+--- a/plans/agent-context-processors.md
++++ b/plans/agent-context-processors.md
+@@ -1,8 +1,8 @@
+ ---
+ title: Implementation plan — Agent Context Processor plugin system
+-status: active
++status: archived
+ created: 2026-06-13
+-updated: 2026-06-13  # added optional per-processor Langfuse span emission
++updated: 2026-06-13  # implemented: context_processors/ package, BaseAgent seams, tests all green
+ owner: Vitaly Chashin
+ supersedes: []
+ related:
+diff --git a/plans/gaps/agent-context-processors.md b/plans/gaps/agent-context-processors.md
+index 61af039..7db961c 100644
+--- a/plans/gaps/agent-context-processors.md
++++ b/plans/gaps/agent-context-processors.md
+@@ -25,26 +25,29 @@ Close each by setting it resolved here (keep the node) once the plan/implementat
+    to a non-finish resume state + injects the corrective message. (Sub-question for the plan:
+    which exact `AgentStatesEnum` member is the correct "resume" state.)
+ 
+-2. **Issue-1 counting scope.** Count *every* repeated identical call, or only repeated
+-   **failed** ones (result string starts with `Error:`, per `base_tool.py:90-92`)? Counting
+-   all is simpler and also catches stuck-on-success loops; failed-only is narrower.
+-
+-3. **Drop-tool vs instruct.** Removing the tool from `_prepare_tools` is deterministic but
+-   shrinks capability and may confuse the model; injecting a "stop repeating tool X" message
+-   is softer but unreliable. Which does the LLM handle better in practice? Possibly both,
+-   gated by config.
+-
+-4. **Provider / gateway side-effects of a shrinking tool list.** Does dropping a tool mid-run
+-   interact badly with prompt/tool-list caching, or with the Context Forge MCP gateway's
+-   expectations for the agent-as-tool surface? Needs a quick check before relying on it.
+-
+-5. **Config merge semantics.** If we want a global baseline of context processors that
+-   per-agent config extends/overrides (rather than pure per-agent lists), define the merge
+-   rule. The existing `agent_level_config_override_validator` (`agent_definition.py:280`)
+-   does field-level `model_copy(update=...)`, which replaces lists wholesale — extend
+-   semantics would need explicit handling.
+-
+-6. **Fail policy granularity.** Confirm per-hook failure behaviour: a throwing
+-   `on_prepare_tools` must not kill the agent (fall back to the unmodified toolkit), but a
+-   throwing `on_before_finish` veto should probably let the agent finish rather than loop
+-   forever. Decide and document.
++2. ~~**Issue-1 counting scope.**~~ **RESOLVED 2026-06-13.** Both, gated by config:
++   `RepeatedToolCallGuard` counts every call by default and exposes `failed_only: bool`
++   (`repeated_tool_call_guard.py`) to narrow to results starting with `"Error:"`.
++
++3. **Drop-tool vs instruct.** **Partially resolved 2026-06-13.** v1 ships the deterministic
++   *drop* (`on_prepare_tools` returns tool names to drop). The softer *instruct* path is
++   **deferred**: the prepare-tools seam returns only a `set[str]` and has no message-injection
++   channel (only `on_before_finish` injects). `RepeatedToolCallGuard` accepts an `announce`
++   flag but it currently only tags the emitted span — conversation injection of a "tool X
++   disabled" note still needs a seam that can mutate the conversation. Reopen if needed.
++
++4. **Provider / gateway side-effects of a shrinking tool list.** STILL OPEN. Dropping a tool
++   mid-run is implemented and unit/loop tested, but the interaction with prompt/tool-list
++   caching and the Context Forge MCP gateway's agent-as-tool surface is unverified — check
++   before relying on drop-mid-run in production.
++
++5. ~~**Config merge semantics.**~~ **DEFERRED (decided) 2026-06-13.** v1 is per-agent
++   *replace*: `context_processors` is a plain `list` field on `AgentConfig`, so the override
++   validator (`agent_definition.py`) passes it through untouched (per-agent value replaces the
++   global default). Global-baseline + per-agent-extend merge is future work.
++
++6. ~~**Fail policy granularity.**~~ **RESOLVED 2026-06-13.** Implemented in
++   `AgentContextProcessorChain` (`context_processors/base.py`): all three hooks are
++   fail-safe-but-visible (logged at WARNING). A throwing `on_prepare_tools` contributes no
++   drops (agent keeps full toolkit); a throwing `on_before_finish` is treated as no veto
++   (agent finishes — fail toward termination, never an infinite loop).
+diff --git a/research/agent-context-processors.md b/research/agent-context-processors.md
+index 267d02e..8ee13f9 100644
+--- a/research/agent-context-processors.md
++++ b/research/agent-context-processors.md
+@@ -1,8 +1,8 @@
+ ---
+ title: Generalizing context modification into an Agent Context Processor plugin system
+-status: active
++status: archived
+ created: 2026-06-13
+-updated: 2026-06-13  # gap #1 resolved: tool_choice=required → terminate via FinalAnswerTool
++updated: 2026-06-13  # implemented in sgr_agent_core/context_processors/ (plan archived)
+ owner: Vitaly Chashin
+ related:
+   - notes/processor-plugin-pattern.md
+diff --git a/sgr_agent_core/agent_definition.py b/sgr_agent_core/agent_definition.py
+index 8f2d715..a022e2a 100644
+--- a/sgr_agent_core/agent_definition.py
++++ b/sgr_agent_core/agent_definition.py
+@@ -10,6 +10,8 @@ import yaml
+ from fastmcp.mcp_config import MCPConfig
+ from pydantic import BaseModel, Field, FilePath, ImportString, computed_field, field_validator, model_validator
+ 
++from sgr_agent_core.context_processors.base import ContextProcessorDefinition
++
+ logger = logging.getLogger(__name__)
+ 
+ 
+@@ -162,6 +164,10 @@ class AgentConfig(BaseModel, extra="allow"):
+     execution: ExecutionConfig = Field(default_factory=ExecutionConfig, description="Execution settings")
+     prompts: PromptsConfig = Field(default_factory=PromptsConfig, description="Prompts settings")
+     mcp: MCPConfig = Field(default_factory=MCPConfig, description="MCP settings")
++    context_processors: list[ContextProcessorDefinition] = Field(
++        default_factory=list,
++        description="Per-agent context processors run at agent-loop seams (replace, not merge, the global list)",
++    )
+ 
+ 
+ class ToolDefinition(BaseModel, extra="allow"):
+diff --git a/sgr_agent_core/base_agent.py b/sgr_agent_core/base_agent.py
+index 9955063..ebe44c8 100644
+--- a/sgr_agent_core/base_agent.py
++++ b/sgr_agent_core/base_agent.py
+@@ -64,6 +64,12 @@ class BaseAgent(AgentRegistryMixin):
+         self._execute_task: asyncio.Task | None = None
+         self._last_llm_call: dict | None = None
+ 
++        # Agent Context Processor chain (built per run in _execute; None = zero-cost path).
++        # _current_iter_span lets _prepare_tools (deeper in the call stack, without iter_span
++        # in scope) parent any emitted span under the active iteration.
++        self._context_chain: Any = None
++        self._current_iter_span: Any = None
++
+     @staticmethod
+     def _truncate(value: Any, max_len: int = 2000) -> str:
+         """Safely truncate any value to a string with max length."""
+@@ -223,6 +229,17 @@ class BaseAgent(AgentRegistryMixin):
+         tools = set(self.toolkit)
+         if self._context.iteration >= self.config.execution.max_iterations:
+             raise RuntimeError("Max iterations reached")
++        if self._context_chain:
++            from sgr_agent_core.observability import get_provider
++
++            drop = await self._context_chain.run_prepare_tools(
++                list(self.toolkit),
++                self._context,
++                self.config,
++                provider=get_provider(),
++                parent_span=self._current_iter_span,
++            )
++            tools = {t for t in tools if t.tool_name not in drop}
+         return [pydantic_function_tool(tool, name=tool.tool_name) for tool in tools]
+ 
+     async def _reasoning_phase(self) -> ReasoningTool:
+@@ -344,6 +361,15 @@ class BaseAgent(AgentRegistryMixin):
+                     provider=provider,
+                     trace_handle=trace,
+                 )
++            if self._context_chain:
++                await self._context_chain.run_on_tool_end(
++                    action_tool,
++                    tool_result,
++                    self._context,
++                    self.config,
++                    provider=provider,
++                    parent_span=tool_span,
++                )
+         except Exception as tool_err:
+             provider.end_span(
+                 tool_span,
+@@ -440,6 +466,12 @@ class BaseAgent(AgentRegistryMixin):
+         from sgr_agent_core.observability.metrics import build_metrics_chain
+ 
+         metrics_chain = build_metrics_chain(_GlobalConfig._instance or _GlobalConfig())
++
++        # Build per-agent context processor chain (None if none configured = zero overhead).
++        from sgr_agent_core.context_processors import build_context_processor_chain
++
++        self._context_chain = build_context_processor_chain(self.config)
++
+         if metrics_chain:
+             await metrics_chain.run_hook(
+                 "on_trace_start",
+@@ -512,9 +544,25 @@ class BaseAgent(AgentRegistryMixin):
+                     metadata={"searches_used": self._context.searches_used},
+                     _parent=trace,
+                 )
++                # Expose the active iteration span so _prepare_tools (deeper in the
++                # call stack) can parent any context-processor span under it.
++                self._current_iter_span = iter_span
+ 
+                 try:
+                     await self._execution_step(iter_span=iter_span, metrics_chain=metrics_chain, trace=trace)
++
++                    # Agent Context Processor: before-finish seam. Runs right after a terminal
++                    # tool drove a finish state, before the loop re-checks. A veto resets the
++                    # state to a non-finish resume state and injects corrective messages.
++                    if self._context_chain and self._context.state in AgentStatesEnum.FINISH_STATES.value:
++                        decision = await self._context_chain.run_before_finish(
++                            self._context, self.config, provider=provider, parent_span=iter_span
++                        )
++                        if decision.force_continue:
++                            for m in decision.inject_messages:
++                                self.conversation.append(m)
++                            self._context.state = AgentStatesEnum.RESEARCHING
++
+                     # Build iteration output with reasoning data if available
+                     iter_output: dict[str, Any] = {"state_after": self._context.state.value}
+                     reasoning = self._context.current_step_reasoning
+diff --git a/sgr_agent_core/context_processors/__init__.py b/sgr_agent_core/context_processors/__init__.py
+new file mode 100644
+index 0000000..71051f4
+--- /dev/null
++++ b/sgr_agent_core/context_processors/__init__.py
+@@ -0,0 +1,33 @@
++"""Agent Context Processor plugin system.
++
++Built-in processors are imported here to trigger auto-registration in
++``AgentContextProcessorRegistry``.
++"""
++
++from __future__ import annotations
++
++import sgr_agent_core.context_processors.mandatory_tool_call  # noqa: F401, E402
++import sgr_agent_core.context_processors.repeated_tool_call_guard  # noqa: F401, E402
++from sgr_agent_core.context_processors.base import (
++    AgentContextProcessor,
++    AgentContextProcessorChain,
++    AgentContextProcessorRegistry,
++    ContextProcessorDefinition,
++    FinishDecision,
++    build_context_processor_chain,
++    emit_event_span,
++)
++from sgr_agent_core.context_processors.mandatory_tool_call import MandatoryToolCallProcessor
++from sgr_agent_core.context_processors.repeated_tool_call_guard import RepeatedToolCallGuard
++
++__all__ = [
++    "AgentContextProcessor",
++    "AgentContextProcessorChain",
++    "AgentContextProcessorRegistry",
++    "ContextProcessorDefinition",
++    "FinishDecision",
++    "build_context_processor_chain",
++    "emit_event_span",
++    "RepeatedToolCallGuard",
++    "MandatoryToolCallProcessor",
++]
+diff --git a/sgr_agent_core/context_processors/base.py b/sgr_agent_core/context_processors/base.py
+new file mode 100644
+index 0000000..e591055
+--- /dev/null
++++ b/sgr_agent_core/context_processors/base.py
+@@ -0,0 +1,264 @@
++"""Agent Context Processor plugin system.
++
++The third processor-plugin family in SGR Agent Core (after the MCP payload
++processor and the metrics processor). It fills the "read-write at loop seams"
++quadrant: a context processor runs at agent-loop seams and may *change* what the
++agent does — drop a repeated tool before tool selection, or veto a premature
++finish and inject a corrective message.
++
++It reuses the established skeleton (see ``notes/processor-plugin-pattern.md``):
++an ABC that auto-registers concrete subclasses, a ``*Definition`` Pydantic
++model, a ``*Chain`` runner, and registry-then-import-string resolution.
++
++Observability is **optional and per-processor**. The base contract emits
++nothing; every hook is merely *offered* the active ``provider`` and a
++``parent_span`` via kwargs. A processor that wants monitoring calls
++``emit_event_span`` (a no-op under ``NoOpProvider``); one that doesn't ignores
++the kwargs.
++"""
++
++from __future__ import annotations
++
++import importlib
++import logging
++from abc import ABC
++from dataclasses import dataclass, field
++from typing import TYPE_CHECKING, Any
++
++from pydantic import BaseModel, Field
++
++from sgr_agent_core.services.registry import Registry
++
++if TYPE_CHECKING:
++    from sgr_agent_core.agent_definition import AgentConfig
++    from sgr_agent_core.base_tool import BaseTool
++    from sgr_agent_core.models import AgentContext
++
++logger = logging.getLogger(__name__)
++
++
++@dataclass
++class FinishDecision:
++    """Directive returned by ``on_before_finish`` to veto a premature finish.
++
++    ``force_continue`` keeps the agent running; ``inject_messages`` are OpenAI
++    message dicts appended to the conversation before the next iteration.
++    """
++
++    force_continue: bool = False
++    inject_messages: list[dict[str, Any]] = field(default_factory=list)
++    reason: str | None = None
++
++
++class AgentContextProcessorRegistry(Registry["AgentContextProcessor"]):
++    """Registry for agent context processor classes."""
++
++
++class AgentContextProcessor(ABC):
++    """Abstract base for agent context processors.
++
++    Runs read-write at agent-loop seams. All hooks are optional and default to
++    a no-op; override only the seams you need. Subclasses auto-register in
++    ``AgentContextProcessorRegistry`` on definition.
++
++    Every hook also receives ``provider`` (the active ``ObservabilityProvider``)
++    and ``parent_span`` (a span handle or ``None``) in ``**kw`` for *optional*
++    span emission via :func:`emit_event_span`. The base class emits nothing.
++    """
++
++    def __init__(self, processor_config: dict[str, Any] | None = None):
++        self.processor_config = processor_config or {}
++
++    def __init_subclass__(cls, **kwargs: Any) -> None:
++        super().__init_subclass__(**kwargs)
++        if not getattr(cls, "__abstractmethods__", set()):
++            AgentContextProcessorRegistry.register(cls, name=cls.__name__)
++
++    async def on_tool_end(
++        self,
++        *,
++        tool: BaseTool,
++        result: str,
++        context: AgentContext,
++        config: AgentConfig,
++        **kw: Any,
++    ) -> None:
++        """Called after each tool executes. Receives the tool *instance*."""
++        return None
++
++    async def on_prepare_tools(
++        self,
++        *,
++        toolkit: list[type[BaseTool]],
++        context: AgentContext,
++        config: AgentConfig,
++        **kw: Any,
++    ) -> set[str]:
++        """Called before tool selection. Return tool names to drop."""
++        return set()
++
++    async def on_before_finish(
++        self,
++        *,
++        context: AgentContext,
++        config: AgentConfig,
++        **kw: Any,
++    ) -> FinishDecision | None:
++        """Called when the agent enters a finish state. Return a veto or None."""
++        return None
++
++
++class AgentContextProcessorChain:
++    """Ordered chain of context processors. Fail-safe-but-visible per hook."""
++
++    def __init__(self, processors: list[AgentContextProcessor]):
++        self.processors = processors
++
++    async def run_on_tool_end(
++        self,
++        tool: BaseTool,
++        result: str,
++        context: AgentContext,
++        config: AgentConfig,
++        *,
++        provider: Any = None,
++        parent_span: Any = None,
++    ) -> None:
++        for p in self.processors:
++            try:
++                await p.on_tool_end(
++                    tool=tool,
++                    result=result,
++                    context=context,
++                    config=config,
++                    provider=provider,
++                    parent_span=parent_span,
++                )
++            except Exception as e:
++                logger.warning("ctx-proc %s.on_tool_end failed: %s: %s", type(p).__name__, type(e).__name__, e)
++
++    async def run_prepare_tools(
++        self,
++        toolkit: list[type[BaseTool]],
++        context: AgentContext,
++        config: AgentConfig,
++        *,
++        provider: Any = None,
++        parent_span: Any = None,
++    ) -> set[str]:
++        drop: set[str] = set()
++        for p in self.processors:
++            try:
++                drop |= await p.on_prepare_tools(
++                    toolkit=toolkit,
++                    context=context,
++                    config=config,
++                    provider=provider,
++                    parent_span=parent_span,
++                )
++            except Exception as e:
++                # Fail-safe: this processor contributes no drops, agent keeps full toolkit.
++                logger.warning("ctx-proc %s.on_prepare_tools failed: %s: %s", type(p).__name__, type(e).__name__, e)
++        # NEVER drop system/terminal tools — the agent must always be able to finish.
++        system_names = {t.tool_name for t in toolkit if getattr(t, "isSystemTool", False)}
++        return drop - system_names
++
++    async def run_before_finish(
++        self,
++        context: AgentContext,
++        config: AgentConfig,
++        *,
++        provider: Any = None,
++        parent_span: Any = None,
++    ) -> FinishDecision:
++        merged = FinishDecision()
++        for p in self.processors:
++            try:
++                d = await p.on_before_finish(
++                    context=context,
++                    config=config,
++                    provider=provider,
++                    parent_span=parent_span,
++                )
++            except Exception as e:
++                # Fail-safe: a throwing veto lets the agent finish (never loop forever).
++                logger.warning("ctx-proc %s.on_before_finish failed: %s: %s", type(p).__name__, type(e).__name__, e)
++                continue
++            if d and d.force_continue:
++                merged.force_continue = True
++                merged.inject_messages.extend(d.inject_messages)
++        return merged
++
++
++class ContextProcessorDefinition(BaseModel, extra="allow"):
++    """Definition of a single context processor in YAML config."""
++
++    class_name: str = Field(alias="class", description="Processor class name or import string")
++    config: dict[str, Any] = Field(default_factory=dict)
++
++
++def build_context_processor_chain(config: AgentConfig) -> AgentContextProcessorChain | None:
++    """Build a per-agent context processor chain from config.
++
++    Returns ``None`` when no processors are configured (zero-cost path). Built
++    once per run so processor instances hold per-request state with no
++    cross-request leakage.
++    """
++    defs = getattr(config, "context_processors", None) or []
++    if not defs:
++        return None
++
++    processors: list[AgentContextProcessor] = []
++    for raw in defs:
++        try:
++            defn = (
++                raw if isinstance(raw, ContextProcessorDefinition) else ContextProcessorDefinition.model_validate(raw)
++            )
++        except Exception as e:
++            logger.warning("Failed to parse context processor definition %r: %s. Skipping.", raw, e)
++            continue
++        # Resolve class: registry first, then dotted import string.
++        cls = AgentContextProcessorRegistry.get(defn.class_name)
++        if cls is None:
++            try:
++                module_path, class_name = defn.class_name.rsplit(".", 1)
++                module = importlib.import_module(module_path)
++                cls = getattr(module, class_name)
++            except (ValueError, ImportError, AttributeError) as e:
++                logger.warning(
++                    "Context processor '%s' not found in registry and cannot be imported: %s. Skipping.",
++                    defn.class_name,
++                    e,
++                )
++                continue
++        try:
++            processors.append(cls(defn.config))
++        except Exception as e:
++            logger.warning("Failed to initialize context processor '%s': %s. Skipping.", defn.class_name, e)
++
++    if not processors:
++        return None
++
++    logger.info("Context processor chain initialized with %d processor(s)", len(processors))
++    return AgentContextProcessorChain(processors)
++
++
++def emit_event_span(provider: Any, parent_span: Any, name: str, metadata: dict[str, Any]) -> None:
++    """Emit a zero-duration event span. No-op under ``NoOpProvider``, so always safe to call.
++
++    Used by built-in processors to record *only when they actually fire* (a
++    tool is dropped / a finish is vetoed). Not referenced by the base class.
++    """
++    if provider is None:
++        return
++    try:
++        span = provider.start_span(
++            name=name,
++            span_type="event",
++            input=metadata,
++            metadata=metadata,
++            _parent=parent_span,
++        )
++        provider.end_span(span, output=metadata)
++    except Exception as e:
++        logger.warning("emit_event_span(%s) failed: %s: %s", name, type(e).__name__, e)
+diff --git a/sgr_agent_core/context_processors/mandatory_tool_call.py b/sgr_agent_core/context_processors/mandatory_tool_call.py
+new file mode 100644
+index 0000000..e07500d
+--- /dev/null
++++ b/sgr_agent_core/context_processors/mandatory_tool_call.py
+@@ -0,0 +1,94 @@
++"""Built-in context processor: require a work tool call before finishing (Issue 2).
++
++A router agent can "answer itself" — call the terminal ``FinalAnswerTool`` with
++zero prior *work* tool calls (a work tool is one with ``isSystemTool == False``,
++e.g. delegating to a sub-agent). This processor counts work-tool calls per run
++and, when the agent tries to finish with fewer than ``min_tool_calls``, vetoes
++the finish and injects a corrective message — up to ``max_retries`` times, after
++which it lets the agent finish (safety valve, never an infinite veto).
++"""
++
++from __future__ import annotations
++
++import logging
++from typing import TYPE_CHECKING, Any
++
++from sgr_agent_core.context_processors.base import AgentContextProcessor, FinishDecision, emit_event_span
++
++if TYPE_CHECKING:
++    from sgr_agent_core.agent_definition import AgentConfig
++    from sgr_agent_core.base_tool import BaseTool
++    from sgr_agent_core.models import AgentContext
++
++logger = logging.getLogger(__name__)
++
++_DEFAULT_MESSAGE = (
++    "On the previous step you did not call any tool. You must call a tool "
++    "(e.g. delegate to a sub-agent) before finishing."
++)
++
++
++class MandatoryToolCallProcessor(AgentContextProcessor):
++    """Veto a finish that happens before ``min_tool_calls`` work-tool calls.
++
++    Config:
++        min_tool_calls (int): required number of work-tool calls. Default 1.
++        max_retries (int): how many times to veto before allowing finish. Default 2.
++        message (str): corrective message injected on veto.
++    """
++
++    def __init__(self, processor_config: dict[str, Any] | None = None):
++        super().__init__(processor_config)
++        self.min_tool_calls = int(self.processor_config.get("min_tool_calls", 1))
++        self.max_retries = int(self.processor_config.get("max_retries", 2))
++        self.message = self.processor_config.get("message", _DEFAULT_MESSAGE)
++        self._work_calls = 0
++        self._retries = 0
++
++    async def on_tool_end(
++        self,
++        *,
++        tool: BaseTool,
++        result: str,
++        context: AgentContext,
++        config: AgentConfig,
++        **kw: Any,
++    ) -> None:
++        if not getattr(tool, "isSystemTool", False):
++            self._work_calls += 1
++
++    async def on_before_finish(
++        self,
++        *,
++        context: AgentContext,
++        config: AgentConfig,
++        provider: Any = None,
++        parent_span: Any = None,
++        **kw: Any,
++    ) -> FinishDecision | None:
++        if self._work_calls < self.min_tool_calls and self._retries < self.max_retries:
++            self._retries += 1
++            emit_event_span(
++                provider,
++                parent_span,
++                name="ctx-processor.mandatory_tool_call.vetoed",
++                metadata={
++                    "work_calls": self._work_calls,
++                    "min_tool_calls": self.min_tool_calls,
++                    "retry": self._retries,
++                    "iteration": getattr(context, "iteration", None),
++                },
++            )
++            logger.info(
++                "MandatoryToolCallProcessor vetoing finish (work_calls=%d < %d, retry %d/%d)",
++                self._work_calls,
++                self.min_tool_calls,
++                self._retries,
++                self.max_retries,
++            )
++            return FinishDecision(
++                force_continue=True,
++                inject_messages=[{"role": "user", "content": self.message}],
++                reason="router finished with no work calls",
++            )
++        return None
+diff --git a/sgr_agent_core/context_processors/repeated_tool_call_guard.py b/sgr_agent_core/context_processors/repeated_tool_call_guard.py
+new file mode 100644
+index 0000000..413f4ca
+--- /dev/null
++++ b/sgr_agent_core/context_processors/repeated_tool_call_guard.py
+@@ -0,0 +1,101 @@
++"""Built-in context processor: guard against repeated tool calls (Issue 1).
++
++A leaf agent can get stuck calling the same tool over and over (often a failing
++MCP call that returns ``"Error: ..."``) until ``max_iterations``. This guard
++counts tool calls per run and, once a tool crosses ``max_repeats``, drops it
++from the toolkit at the next ``on_prepare_tools`` seam so the agent is forced to
++finish instead of looping.
++"""
++
++from __future__ import annotations
++
++import hashlib
++import json
++import logging
++from typing import TYPE_CHECKING, Any
++
++from sgr_agent_core.context_processors.base import AgentContextProcessor, emit_event_span
++
++if TYPE_CHECKING:
++    from sgr_agent_core.agent_definition import AgentConfig
++    from sgr_agent_core.base_tool import BaseTool
++    from sgr_agent_core.models import AgentContext
++
++logger = logging.getLogger(__name__)
++
++
++class RepeatedToolCallGuard(AgentContextProcessor):
++    """Drop a tool after it has been called ``max_repeats`` times in a run.
++
++    Config:
++        max_repeats (int): threshold at which the tool is dropped. Default 3.
++        scope ("exact_args" | "tool_name"): count identical-argument calls, or
++            all calls of the same tool name. Default "exact_args".
++        failed_only (bool): only count calls whose result starts with "Error:".
++            Default False.
++        announce (bool): reserved for an optional "tool disabled" note. The
++            prepare-tools seam has no message channel today, so this only tags
++            the emitted span; conversation injection is deferred (gap #3).
++    """
++
++    def __init__(self, processor_config: dict[str, Any] | None = None):
++        super().__init__(processor_config)
++        self.max_repeats = int(self.processor_config.get("max_repeats", 3))
++        self.scope = self.processor_config.get("scope", "exact_args")
++        self.failed_only = bool(self.processor_config.get("failed_only", False))
++        self.announce = bool(self.processor_config.get("announce", True))
++        self._counts: dict[str, int] = {}
++        self._key_tool: dict[str, str] = {}
++
++    def _key(self, tool: BaseTool) -> str:
++        if self.scope == "tool_name":
++            return tool.tool_name
++        payload = json.dumps(tool.model_dump(mode="json"), sort_keys=True, ensure_ascii=False)
++        return hashlib.sha1(f"{tool.tool_name}{payload}".encode("utf-8")).hexdigest()
++
++    async def on_tool_end(
++        self,
++        *,
++        tool: BaseTool,
++        result: str,
++        context: AgentContext,
++        config: AgentConfig,
++        **kw: Any,
++    ) -> None:
++        if getattr(tool, "isSystemTool", False):
++            return
++        if self.failed_only and not str(result).startswith("Error:"):
++            return
++        key = self._key(tool)
++        self._counts[key] = self._counts.get(key, 0) + 1
++        self._key_tool[key] = tool.tool_name
++
++    async def on_prepare_tools(
++        self,
++        *,
++        toolkit: list[type[BaseTool]],
++        context: AgentContext,
++        config: AgentConfig,
++        provider: Any = None,
++        parent_span: Any = None,
++        **kw: Any,
++    ) -> set[str]:
++        # Map every crossed key back to its tool name.
++        crossed = {k: c for k, c in self._counts.items() if c >= self.max_repeats}
++        drop = {self._key_tool[k] for k in crossed}
++        for name in sorted(drop):
++            count = max(c for k, c in crossed.items() if self._key_tool[k] == name)
++            emit_event_span(
++                provider,
++                parent_span,
++                name="ctx-processor.repeated_tool_call_guard.dropped",
++                metadata={
++                    "tool": name,
++                    "count": count,
++                    "scope": self.scope,
++                    "announce": self.announce,
++                    "iteration": getattr(context, "iteration", None),
++                },
++            )
++            logger.info("RepeatedToolCallGuard dropping tool '%s' after %d repeats", name, count)
++        return drop
+diff --git a/tests/context_processors/__init__.py b/tests/context_processors/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/tests/context_processors/conftest.py b/tests/context_processors/conftest.py
+new file mode 100644
+index 0000000..99069cb
+--- /dev/null
++++ b/tests/context_processors/conftest.py
+@@ -0,0 +1,69 @@
++"""Shared fixtures and stubs for context processor tests."""
++
++from typing import Any
++from unittest.mock import Mock
++
++import pytest
++
++from sgr_agent_core.base_tool import BaseTool, SystemBaseTool
++
++
++class StubWorkTool(BaseTool):
++    """A non-system (work) tool that echoes a query."""
++
++    tool_name = "stub_work_tool"
++    query: str = ""
++
++    async def __call__(self, context, config, **kw) -> str:
++        return f"ok: {self.query}"
++
++
++class StubFailingTool(BaseTool):
++    """A work tool whose result looks like an MCP error string."""
++
++    tool_name = "stub_failing_tool"
++    query: str = ""
++
++    async def __call__(self, context, config, **kw) -> str:
++        return "Error: backend unavailable"
++
++
++class StubSystemTool(SystemBaseTool):
++    """A system tool — must never be counted or dropped."""
++
++    tool_name = "stub_system_tool"
++    payload: str = ""
++
++    async def __call__(self, context, config, **kw) -> str:
++        return "system ok"
++
++
++class FakeProvider:
++    """Records start_span calls so tests can assert emission."""
++
++    def __init__(self) -> None:
++        self.spans: list[dict[str, Any]] = []
++
++    def start_span(self, *, name, span_type="span", input=None, metadata=None, _parent=None):
++        self.spans.append({"name": name, "metadata": metadata})
++        return object()
++
++    def end_span(self, handle, *, output=None, status=None, level="DEFAULT"):
++        pass
++
++
++@pytest.fixture
++def fake_provider() -> FakeProvider:
++    return FakeProvider()
++
++
++@pytest.fixture
++def mock_context():
++    ctx = Mock()
++    ctx.iteration = 1
++    return ctx
++
++
++@pytest.fixture
++def mock_config():
++    return Mock()
+diff --git a/tests/context_processors/test_base.py b/tests/context_processors/test_base.py
+new file mode 100644
+index 0000000..934960b
+--- /dev/null
++++ b/tests/context_processors/test_base.py
+@@ -0,0 +1,135 @@
++"""Unit tests for the Agent Context Processor base: ABC, registry, chain, builder."""
++
++import pytest
++
++from sgr_agent_core.context_processors.base import (
++    AgentContextProcessor,
++    AgentContextProcessorChain,
++    AgentContextProcessorRegistry,
++    ContextProcessorDefinition,
++    FinishDecision,
++    build_context_processor_chain,
++    emit_event_span,
++)
++from tests.context_processors.conftest import StubSystemTool, StubWorkTool
++
++
++class DropEverythingProcessor(AgentContextProcessor):
++    """Returns every toolkit name as a drop candidate."""
++
++    async def on_prepare_tools(self, *, toolkit, context, config, **kw):
++        return {t.tool_name for t in toolkit}
++
++
++class ThrowingProcessor(AgentContextProcessor):
++    """Raises in every hook to exercise fail-safety."""
++
++    async def on_prepare_tools(self, *, toolkit, context, config, **kw):
++        raise ValueError("boom prepare")
++
++    async def on_before_finish(self, *, context, config, **kw):
++        raise ValueError("boom finish")
++
++
++class VetoOnceProcessor(AgentContextProcessor):
++    async def on_before_finish(self, *, context, config, **kw):
++        return FinishDecision(force_continue=True, inject_messages=[{"role": "user", "content": "again"}])
++
++
++class TestRegistry:
++    def test_builtins_registered(self):
++        assert AgentContextProcessorRegistry.get("RepeatedToolCallGuard") is not None
++        assert AgentContextProcessorRegistry.get("MandatoryToolCallProcessor") is not None
++
++    def test_local_processors_registered(self):
++        assert AgentContextProcessorRegistry.get("DropEverythingProcessor") is not None
++
++    def test_get_nonexistent_returns_none(self):
++        assert AgentContextProcessorRegistry.get("NoSuchProcessor") is None
++
++
++class TestBuilder:
++    def test_empty_returns_none(self):
++        cfg = type("C", (), {"context_processors": []})()
++        assert build_context_processor_chain(cfg) is None
++
++    def test_missing_attr_returns_none(self):
++        assert build_context_processor_chain(object()) is None
++
++    def test_resolve_by_registry_name(self):
++        cfg = type("C", (), {"context_processors": [{"class": "MandatoryToolCallProcessor", "config": {}}]})()
++        chain = build_context_processor_chain(cfg)
++        assert chain is not None
++        assert len(chain.processors) == 1
++        assert type(chain.processors[0]).__name__ == "MandatoryToolCallProcessor"
++
++    def test_resolve_by_dotted_import(self):
++        dotted = "sgr_agent_core.context_processors.repeated_tool_call_guard.RepeatedToolCallGuard"
++        cfg = type("C", (), {"context_processors": [{"class": dotted, "config": {"max_repeats": 5}}]})()
++        chain = build_context_processor_chain(cfg)
++        assert chain is not None
++        assert chain.processors[0].max_repeats == 5
++
++    def test_unknown_class_skipped(self):
++        cfg = type("C", (), {"context_processors": [{"class": "TotallyUnknownProcessor"}]})()
++        assert build_context_processor_chain(cfg) is None
++
++
++class TestDefinition:
++    def test_alias_and_defaults(self):
++        defn = ContextProcessorDefinition.model_validate({"class": "Foo"})
++        assert defn.class_name == "Foo"
++        assert defn.config == {}
++
++    def test_with_config(self):
++        defn = ContextProcessorDefinition.model_validate({"class": "Foo", "config": {"a": 1}})
++        assert defn.config == {"a": 1}
++
++
++class TestChainPrepareTools:
++    @pytest.mark.asyncio
++    async def test_system_tools_never_dropped(self, mock_context, mock_config):
++        chain = AgentContextProcessorChain([DropEverythingProcessor()])
++        toolkit = [StubWorkTool, StubSystemTool]
++        drop = await chain.run_prepare_tools(toolkit, mock_context, mock_config)
++        assert StubWorkTool.tool_name in drop
++        assert StubSystemTool.tool_name not in drop
++
++    @pytest.mark.asyncio
++    async def test_throwing_processor_is_fail_safe(self, mock_context, mock_config):
++        chain = AgentContextProcessorChain([ThrowingProcessor(), DropEverythingProcessor()])
++        toolkit = [StubWorkTool]
++        # ThrowingProcessor contributes nothing; DropEverythingProcessor still drops.
++        drop = await chain.run_prepare_tools(toolkit, mock_context, mock_config)
++        assert drop == {StubWorkTool.tool_name}
++
++
++class TestChainBeforeFinish:
++    @pytest.mark.asyncio
++    async def test_veto_merges(self, mock_context, mock_config):
++        chain = AgentContextProcessorChain([VetoOnceProcessor()])
++        decision = await chain.run_before_finish(mock_context, mock_config)
++        assert decision.force_continue is True
++        assert decision.inject_messages == [{"role": "user", "content": "again"}]
++
++    @pytest.mark.asyncio
++    async def test_throwing_finish_allows_finish(self, mock_context, mock_config):
++        chain = AgentContextProcessorChain([ThrowingProcessor()])
++        decision = await chain.run_before_finish(mock_context, mock_config)
++        assert decision.force_continue is False
++
++    @pytest.mark.asyncio
++    async def test_no_processors_allows_finish(self, mock_context, mock_config):
++        chain = AgentContextProcessorChain([])
++        decision = await chain.run_before_finish(mock_context, mock_config)
++        assert decision.force_continue is False
++
++
++class TestEmitEventSpan:
++    def test_none_provider_is_noop(self):
++        emit_event_span(None, None, "x", {})  # must not raise
++
++    def test_records_span(self, fake_provider):
++        emit_event_span(fake_provider, None, "ctx.test", {"k": "v"})
++        assert len(fake_provider.spans) == 1
++        assert fake_provider.spans[0]["name"] == "ctx.test"
+diff --git a/tests/context_processors/test_loop_integration.py b/tests/context_processors/test_loop_integration.py
+new file mode 100644
+index 0000000..48d1a14
+--- /dev/null
++++ b/tests/context_processors/test_loop_integration.py
+@@ -0,0 +1,130 @@
++"""Loop integration tests: context processors driving a real ToolCallingAgent loop."""
++
++from typing import ClassVar
++from unittest.mock import Mock
++
++import pytest
++from openai import AsyncOpenAI
++from pydantic import Field
++
++from sgr_agent_core.agent_definition import AgentConfig, ExecutionConfig, LLMConfig, PromptsConfig
++from sgr_agent_core.agents import ToolCallingAgent
++from sgr_agent_core.base_tool import BaseTool
++from sgr_agent_core.models import AgentStatesEnum
++from sgr_agent_core.tools import FinalAnswerTool
++from tests.test_agent_e2e import MockStream, _create_tool_call
++
++
++class LeafSearchTool(BaseTool):
++    """Work tool that always fails — emulates a stuck leaf-agent retry loop."""
++
++    tool_name: ClassVar[str] = "leaf_search_tool"
++    query: str = Field(default="q")
++
++    async def __call__(self, context, config, **kw) -> str:
++        return "Error: backend unavailable"
++
++
++class DelegateTool(BaseTool):
++    """Work tool that delegates to a sub-agent (returns a non-terminal result)."""
++
++    tool_name: ClassVar[str] = "delegate_tool"
++    task: str = Field(default="t")
++
++    async def __call__(self, context, config, **kw) -> str:
++        return "sub-agent result"
++
++
++def _agent_config(processors: list[dict]) -> AgentConfig:
++    return AgentConfig(
++        llm=LLMConfig(api_key="test-key", base_url="https://api.openai.com/v1", model="gpt-4o-mini"),
++        prompts=PromptsConfig(system_prompt_str="p", initial_user_request_str="p", clarification_response_str="p"),
++        execution=ExecutionConfig(max_iterations=10, max_clarifications=3),
++        context_processors=processors,
++    )
++
++
++def _tool_names(kwargs) -> set[str]:
++    return {t["function"]["name"] for t in kwargs.get("tools", []) if isinstance(t, dict)}
++
++
++def _stream_for(tool):
++    return MockStream(final_completion_data={"content": None, "tool_calls": [_create_tool_call(tool, "call-id")]})
++
++
++@pytest.mark.asyncio
++async def test_repeated_tool_call_guard_breaks_retry_loop():
++    """Leaf agent keeps calling a failing tool; the guard drops it so the agent finishes."""
++    failing = LeafSearchTool(query="same")
++    final = FinalAnswerTool(
++        reasoning="forced to finish", completed_steps=["gave up"], answer="done", status=AgentStatesEnum.COMPLETED
++    )
++
++    client = Mock(spec=AsyncOpenAI)
++
++    def mock_stream(**kwargs):
++        # While the failing tool is available, the model keeps calling it; once dropped, it finishes.
++        return _stream_for(failing if LeafSearchTool.tool_name in _tool_names(kwargs) else final)
++
++    client.chat.completions.stream = Mock(side_effect=mock_stream)
++
++    agent = ToolCallingAgent(
++        task_messages=[{"role": "user", "content": "go"}],
++        openai_client=client,
++        agent_config=_agent_config([{"class": "RepeatedToolCallGuard", "config": {"max_repeats": 3}}]),
++        toolkit=[LeafSearchTool, FinalAnswerTool],
++    )
++
++    result = await agent.execute()
++
++    assert agent._context.state == AgentStatesEnum.COMPLETED
++    assert result == "done"
++    # Dropped after exactly 3 calls, then one finishing iteration → well under max_iterations.
++    assert agent._context.iteration < 10
++    failing_calls = [e for e in agent.log if e.get("tool_name") == LeafSearchTool.tool_name]
++    assert len(failing_calls) == 3
++
++
++@pytest.mark.asyncio
++async def test_mandatory_tool_call_vetoes_self_answer():
++    """Router answers itself; the processor vetoes once and forces a work call first."""
++    delegate = DelegateTool(task="search")
++    final = FinalAnswerTool(
++        reasoning="done", completed_steps=["answered"], answer="final", status=AgentStatesEnum.COMPLETED
++    )
++
++    # Scripted responses: finish immediately → (vetoed) → delegate → finish.
++    script = [final, delegate, final]
++    idx = {"i": 0}
++
++    client = Mock(spec=AsyncOpenAI)
++
++    def mock_stream(**kwargs):
++        tool = script[idx["i"]]
++        idx["i"] += 1
++        return _stream_for(tool)
++
++    client.chat.completions.stream = Mock(side_effect=mock_stream)
++
++    agent = ToolCallingAgent(
++        task_messages=[{"role": "user", "content": "route this"}],
++        openai_client=client,
++        agent_config=_agent_config(
++            [{"class": "MandatoryToolCallProcessor", "config": {"min_tool_calls": 1, "max_retries": 2}}]
++        ),
++        toolkit=[DelegateTool, FinalAnswerTool],
++    )
++
++    result = await agent.execute()
++
++    assert agent._context.state == AgentStatesEnum.COMPLETED
++    assert result == "final"
++    assert agent._context.iteration == 3
++    # The corrective message was injected after the first (vetoed) finish.
++    injected = [
++        m for m in agent.conversation if m.get("role") == "user" and "must call a tool" in str(m.get("content", ""))
++    ]
++    assert len(injected) == 1
++    # The delegate (work) tool ran exactly once.
++    delegate_calls = [e for e in agent.log if e.get("tool_name") == DelegateTool.tool_name]
++    assert len(delegate_calls) == 1
+diff --git a/tests/context_processors/test_mandatory_tool_call.py b/tests/context_processors/test_mandatory_tool_call.py
+new file mode 100644
+index 0000000..79a7327
+--- /dev/null
++++ b/tests/context_processors/test_mandatory_tool_call.py
+@@ -0,0 +1,52 @@
++"""Unit tests for MandatoryToolCallProcessor."""
++
++import pytest
++
++from sgr_agent_core.context_processors.mandatory_tool_call import MandatoryToolCallProcessor
++from tests.context_processors.conftest import StubSystemTool, StubWorkTool
++
++
++class TestVeto:
++    @pytest.mark.asyncio
++    async def test_veto_when_no_work_calls(self, mock_context, mock_config):
++        proc = MandatoryToolCallProcessor({"min_tool_calls": 1, "max_retries": 2})
++        decision = await proc.on_before_finish(context=mock_context, config=mock_config)
++        assert decision is not None
++        assert decision.force_continue is True
++        assert decision.inject_messages[0]["role"] == "user"
++
++    @pytest.mark.asyncio
++    async def test_allows_finish_after_work_call(self, mock_context, mock_config):
++        proc = MandatoryToolCallProcessor({"min_tool_calls": 1, "max_retries": 2})
++        await proc.on_tool_end(tool=StubWorkTool(query="x"), result="ok", context=mock_context, config=mock_config)
++        decision = await proc.on_before_finish(context=mock_context, config=mock_config)
++        assert decision is None
++
++    @pytest.mark.asyncio
++    async def test_system_tools_do_not_satisfy_min(self, mock_context, mock_config):
++        proc = MandatoryToolCallProcessor({"min_tool_calls": 1, "max_retries": 2})
++        await proc.on_tool_end(tool=StubSystemTool(payload="x"), result="ok", context=mock_context, config=mock_config)
++        decision = await proc.on_before_finish(context=mock_context, config=mock_config)
++        assert decision is not None
++        assert decision.force_continue is True
++
++    @pytest.mark.asyncio
++    async def test_safety_valve_allows_finish_after_max_retries(self, mock_context, mock_config):
++        proc = MandatoryToolCallProcessor({"min_tool_calls": 1, "max_retries": 2})
++        # Two vetoes, then allow finish to avoid an infinite loop.
++        assert (await proc.on_before_finish(context=mock_context, config=mock_config)).force_continue is True
++        assert (await proc.on_before_finish(context=mock_context, config=mock_config)).force_continue is True
++        assert await proc.on_before_finish(context=mock_context, config=mock_config) is None
++
++
++class TestEmission:
++    @pytest.mark.asyncio
++    async def test_span_emitted_only_on_veto(self, mock_context, mock_config, fake_provider):
++        proc = MandatoryToolCallProcessor({"min_tool_calls": 1, "max_retries": 1})
++        # Veto → one span.
++        await proc.on_before_finish(context=mock_context, config=mock_config, provider=fake_provider)
++        assert len(fake_provider.spans) == 1
++        assert fake_provider.spans[0]["name"] == "ctx-processor.mandatory_tool_call.vetoed"
++        # Safety valve (no veto) → no new span.
++        await proc.on_before_finish(context=mock_context, config=mock_config, provider=fake_provider)
++        assert len(fake_provider.spans) == 1
+diff --git a/tests/context_processors/test_repeated_tool_call_guard.py b/tests/context_processors/test_repeated_tool_call_guard.py
+new file mode 100644
+index 0000000..94cad69
+--- /dev/null
++++ b/tests/context_processors/test_repeated_tool_call_guard.py
+@@ -0,0 +1,112 @@
++"""Unit tests for RepeatedToolCallGuard."""
++
++import pytest
++
++from sgr_agent_core.context_processors.repeated_tool_call_guard import RepeatedToolCallGuard
++from tests.context_processors.conftest import StubFailingTool, StubSystemTool, StubWorkTool
++
++
++async def _feed(guard, tool, context, config, n):
++    for _ in range(n):
++        await guard.on_tool_end(tool=tool, result=await tool(context, config), context=context, config=config)
++
++
++class TestCounting:
++    @pytest.mark.asyncio
++    async def test_exact_args_counts_identical_calls(self, mock_context, mock_config):
++        guard = RepeatedToolCallGuard({"max_repeats": 3, "scope": "exact_args"})
++        tool = StubWorkTool(query="same")
++        await _feed(guard, tool, mock_context, mock_config, 3)
++        drop = await guard.on_prepare_tools(toolkit=[StubWorkTool], context=mock_context, config=mock_config)
++        assert drop == {StubWorkTool.tool_name}
++
++    @pytest.mark.asyncio
++    async def test_exact_args_distinguishes_args(self, mock_context, mock_config):
++        guard = RepeatedToolCallGuard({"max_repeats": 3, "scope": "exact_args"})
++        for i in range(3):
++            tool = StubWorkTool(query=f"q{i}")
++            await guard.on_tool_end(tool=tool, result="ok", context=mock_context, config=mock_config)
++        # Three distinct arg-sets, each counted once → nothing crosses the threshold.
++        drop = await guard.on_prepare_tools(toolkit=[StubWorkTool], context=mock_context, config=mock_config)
++        assert drop == set()
++
++    @pytest.mark.asyncio
++    async def test_tool_name_scope_counts_regardless_of_args(self, mock_context, mock_config):
++        guard = RepeatedToolCallGuard({"max_repeats": 3, "scope": "tool_name"})
++        for i in range(3):
++            tool = StubWorkTool(query=f"q{i}")
++            await guard.on_tool_end(tool=tool, result="ok", context=mock_context, config=mock_config)
++        drop = await guard.on_prepare_tools(toolkit=[StubWorkTool], context=mock_context, config=mock_config)
++        assert drop == {StubWorkTool.tool_name}
++
++    @pytest.mark.asyncio
++    async def test_below_threshold_not_dropped(self, mock_context, mock_config):
++        guard = RepeatedToolCallGuard({"max_repeats": 3})
++        tool = StubWorkTool(query="x")
++        await _feed(guard, tool, mock_context, mock_config, 2)
++        drop = await guard.on_prepare_tools(toolkit=[StubWorkTool], context=mock_context, config=mock_config)
++        assert drop == set()
++
++
++class TestFailedOnly:
++    @pytest.mark.asyncio
++    async def test_failed_only_ignores_successes(self, mock_context, mock_config):
++        guard = RepeatedToolCallGuard({"max_repeats": 2, "scope": "tool_name", "failed_only": True})
++        tool = StubWorkTool(query="x")
++        await guard.on_tool_end(tool=tool, result="ok", context=mock_context, config=mock_config)
++        await guard.on_tool_end(tool=tool, result="ok", context=mock_context, config=mock_config)
++        drop = await guard.on_prepare_tools(toolkit=[StubWorkTool], context=mock_context, config=mock_config)
++        assert drop == set()
++
++    @pytest.mark.asyncio
++    async def test_failed_only_counts_errors(self, mock_context, mock_config):
++        guard = RepeatedToolCallGuard({"max_repeats": 2, "scope": "tool_name", "failed_only": True})
++        tool = StubFailingTool(query="x")
++        await _feed(guard, tool, mock_context, mock_config, 2)
++        drop = await guard.on_prepare_tools(toolkit=[StubFailingTool], context=mock_context, config=mock_config)
++        assert drop == {StubFailingTool.tool_name}
++
++
++class TestSystemTools:
++    @pytest.mark.asyncio
++    async def test_system_tools_never_counted(self, mock_context, mock_config):
++        guard = RepeatedToolCallGuard({"max_repeats": 1, "scope": "tool_name"})
++        tool = StubSystemTool(payload="x")
++        await _feed(guard, tool, mock_context, mock_config, 5)
++        drop = await guard.on_prepare_tools(toolkit=[StubSystemTool], context=mock_context, config=mock_config)
++        assert drop == set()
++
++
++class TestEmission:
++    @pytest.mark.asyncio
++    async def test_span_emitted_only_when_dropping(self, mock_context, mock_config, fake_provider):
++        guard = RepeatedToolCallGuard({"max_repeats": 2, "scope": "tool_name"})
++        tool = StubWorkTool(query="x")
++
++        # Below threshold → no emission.
++        await guard.on_tool_end(tool=tool, result="ok", context=mock_context, config=mock_config)
++        await guard.on_prepare_tools(
++            toolkit=[StubWorkTool], context=mock_context, config=mock_config, provider=fake_provider
++        )
++        assert fake_provider.spans == []
++
++        # Cross threshold → exactly one span.
++        await guard.on_tool_end(tool=tool, result="ok", context=mock_context, config=mock_config)
++        await guard.on_prepare_tools(
++            toolkit=[StubWorkTool], context=mock_context, config=mock_config, provider=fake_provider
++        )
++        assert len(fake_provider.spans) == 1
++        assert fake_provider.spans[0]["name"] == "ctx-processor.repeated_tool_call_guard.dropped"
++        assert fake_provider.spans[0]["metadata"]["tool"] == StubWorkTool.tool_name
++
++    @pytest.mark.asyncio
++    async def test_noop_provider_runs_clean(self, mock_context, mock_config):
++        from sgr_agent_core.observability.noop import NoOpProvider
++
++        guard = RepeatedToolCallGuard({"max_repeats": 1, "scope": "tool_name"})
++        tool = StubWorkTool(query="x")
++        await guard.on_tool_end(tool=tool, result="ok", context=mock_context, config=mock_config)
++        drop = await guard.on_prepare_tools(
++            toolkit=[StubWorkTool], context=mock_context, config=mock_config, provider=NoOpProvider()
++        )
++        assert drop == {StubWorkTool.tool_name}

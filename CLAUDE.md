@@ -60,6 +60,53 @@ sgr_agent_core/           # Core Python package
 
 MCP servers are configured in `config.yaml` under `mcp.mcpServers`. MCP tools use `MCPBaseTool` which handles calls through the MCP client and converts them to the framework's tool format. The framework uses `fastmcp` ≥ 2.12.4 for MCP server integration.
 
+**Connection retry.** Both MCP connect points retry transient transport errors (connection refused/reset, timeouts, broken sessions) per `execution.mcp_retry` (bounded exponential backoff; `services/retry.py`). Genuine tool errors (`ToolError`/`FastMCPError`) are **never** retried. **Build** (`build_tools_from_mcp`) re-raises after retries (fatal startup) unless `mcp_retry.degrade_on_build_failure: true`, which skips MCP tools instead. **Call** (`MCPBaseTool.__call__`) retries then, on final failure, swallows the error into the result string so the loop continues. The payload processor's `pre_call`/`post_call` run **once**, outside the retry loop. See `notes/mcp-retry.md`.
+
+## Processor Plugins
+
+Three processor-plugin families share one skeleton (auto-registering ABC + `*Definition` + `*Chain` + registry-then-import-string resolution; see `notes/processor-plugin-pattern.md`):
+
+| Family | When it runs | Can mutate? |
+|--------|--------------|-------------|
+| `MCPPayloadProcessor` (`mcp_payload_processor.py`) | per MCP tool call (`pre_call`/`post_call`) | yes |
+| `MetricsProcessor` (`observability/metrics/`) | at loop seams | no (observe only, fail-silent) |
+| `AgentContextProcessor` (`context_processors/`) | at loop seams | yes (read-write) |
+
+**Agent Context Processors** are configured **per-agent** via the `context_processors` list on `AgentConfig` (per-agent value replaces the global default). They run at three seams: `on_prepare_tools` (drop tools before selection), `on_tool_end`, and `on_before_finish` (veto a premature finish + inject messages). Hooks are fail-safe-but-visible (logged at WARNING; failures never loop the agent forever). Each hook is offered the active observability `provider`/`parent_span` for **optional** per-processor span emission (`emit_event_span`, a no-op under `NoOpProvider`). Built-ins: `RepeatedToolCallGuard`, `MandatoryToolCallProcessor`. Config example: `agents.yaml.example`.
+
+## Local Langfuse (observability testing)
+
+A local Langfuse instance is available for manually inspecting traces at
+`http://localhost:3000`. Install the optional SDK with `uv pip install
+"langfuse>=2.0.0,<3.0.0"` (the `observability` extra). Local-only dev keys:
+
+```python
+from langfuse import Langfuse
+
+langfuse = Langfuse(
+    secret_key="sk-lf-fa49d4be-6763-400d-9542-76736c056e65",
+    public_key="pk-lf-519ae97e-7f15-42fa-ab0f-42e7be77fd64",
+    host="http://localhost:3000",
+)
+```
+
+Equivalent framework config (enables the `LangfuseProvider` for an agent run):
+
+```yaml
+observability:
+  enabled: true
+  provider: langfuse
+  capture_tool_definitions: true   # embed tool defs in generation input (Available-tools section)
+  langfuse:
+    public_key: "pk-lf-519ae97e-7f15-42fa-ab0f-42e7be77fd64"
+    secret_key: "sk-lf-fa49d4be-6763-400d-9542-76736c056e65"
+    base_url: "http://localhost:3000"
+```
+
+Demo runner that emits a real `ToolCallingAgent` trace: `scripts/langfuse_tool_trace_demo.py`
+(needs `OPENAI_API_KEY`). These are throwaway local-instance keys — fine to keep
+in-repo, do **not** reuse the pattern for any hosted Langfuse.
+
 ## Development Commands
 
 ```bash

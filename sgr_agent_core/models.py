@@ -71,6 +71,12 @@ class AgentContext(BaseModel):
         default_factory=dict, description="Request-scoped metadata for MCP payload processors"
     )
 
+    error_tags: set[str] = Field(
+        default_factory=set,
+        description="Error category tags accumulated during the run (e.g. 'error', 'error:mcp_tool'). "
+        "Merged into the Langfuse trace tags at end_trace for filtering.",
+    )
+
     conversation_summary: str | None = Field(default=None, description="Rolling summary of older conversation history")
     recent_messages: list[dict[str, Any]] | None = Field(
         default=None, description="Recent window message objects from rolling memory split"

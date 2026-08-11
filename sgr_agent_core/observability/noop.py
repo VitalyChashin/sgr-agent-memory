@@ -52,6 +52,7 @@ class NoOpProvider(ObservabilityProvider):
         *,
         output: dict[str, Any] | None = None,
         status: str | None = None,
+        tags: list[str] | None = None,
     ) -> None:
         pass
 

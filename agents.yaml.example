@@ -104,6 +104,49 @@ agents:
       - "clarification_tool"
       - "final_answer_tool"
 
+  # Example 5b: Agents using context processors (read-write at agent-loop seams)
+  # ----------------------------------------------------------------------------
+  # `context_processors` is a per-agent list. Each entry resolves by registry
+  # class name first, then by dotted import string. Built-ins:
+  #   - RepeatedToolCallGuard: drops a tool after it is called `max_repeats`
+  #     times in a run (breaks stuck leaf-agent retry loops).
+  #   - MandatoryToolCallProcessor: vetoes a finish that happens before
+  #     `min_tool_calls` work-tool calls (stops a router "answering itself"),
+  #     up to `max_retries` times.
+  #
+  # Optional per-entry `span_mode` controls Langfuse span emission for that
+  # processor (default "fired"):
+  #   - "off":    emit nothing (provider withheld; even fired-action markers silent).
+  #   - "fired":  only emit a marker span when the processor actually acts
+  #               (a tool dropped / a finish vetoed). Default — lowest volume.
+  #   - "always": additionally wrap every invocation in a timed span (shows the
+  #               processor ran even when it took no action). Higher span volume.
+  router_agent:
+    base_class: "ToolCallingAgent"
+    tools:
+      - "final_answer_tool"
+    context_processors:
+      - class: "MandatoryToolCallProcessor"
+        span_mode: "always"   # off | fired (default) | always
+        config:
+          min_tool_calls: 1
+          max_retries: 2
+
+  db_leaf_agent:
+    base_class: "ToolCallingAgent"
+    tools:
+      - "final_answer_tool"
+    context_processors:
+      - class: "RepeatedToolCallGuard"
+        config:
+          max_repeats: 3
+          scope: "exact_args"   # or "tool_name"
+          failed_only: false    # true = only count results starting with "Error:"
+          announce: true        # inject a one-time "tool disabled" directive into the
+                                # conversation when a tool is dropped, so the model is
+                                # told why it vanished (instead of silently reconciling).
+          # message: "The tool '{tool}' has been disabled after repeated failed calls. ..."
+
   # Example 5: Agent using inline prompts instead of files
   inline_prompt_agent:
     base_class: "SGRAgent"

@@ -162,10 +162,16 @@ class LangfuseProvider(ObservabilityProvider):
         *,
         output: dict[str, Any] | None = None,
         status: str | None = None,
+        tags: list[str] | None = None,
     ) -> None:
         try:
             if isinstance(handle, LangfuseTraceHandle) and handle.trace is not None:
-                handle.trace.update(output=output, status_message=status)
+                # trace.update(tags=...) replaces the tag list, so callers pass the
+                # full merged set (start-time tags + error tags).
+                update_kwargs: dict[str, Any] = {"output": output, "status_message": status}
+                if tags:
+                    update_kwargs["tags"] = tags
+                handle.trace.update(**update_kwargs)
         except Exception as e:
             logger.warning("Langfuse end_trace failed (non-fatal): %s: %s", type(e).__name__, e)
 
@@ -236,9 +242,13 @@ class LangfuseProvider(ObservabilityProvider):
     ) -> None:
         try:
             if isinstance(handle, LangfuseGenerationHandle) and handle.generation is not None:
+                # The SDK's typed usage only knows input/output/total; a richer breakdown
+                # (e.g. reasoning/cached tokens from _extract_usage) is carried in the
+                # generation metadata instead, so filter to the SDK-known subset here.
+                safe_usage = {k: v for k, v in usage.items() if k in ("input", "output", "total")} if usage else usage
                 handle.generation.end(
                     output=output,
-                    usage=usage,
+                    usage=safe_usage,
                     level=level,
                     status_message=status,
                 )
